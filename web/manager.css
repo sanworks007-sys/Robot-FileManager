@@ -1,0 +1,119 @@
+.rfm-launch {
+    position: fixed; right: 20px; bottom: 20px; z-index: 10000;
+    border: 1px solid var(--border-color, #4e4e4e); border-radius: 10px; padding: 10px 16px;
+    background: var(--comfy-menu-bg, #353535); color: var(--fg-color, #fff); font: 600 14px system-ui, sans-serif;
+    box-shadow: 0 10px 30px #0007; cursor: pointer;
+}
+.rfm-shell, .rfm-shell * { box-sizing: border-box; }
+.rfm-shell {
+    --rfm-bg: var(--bg-color, #202020);
+    --rfm-panel: var(--comfy-menu-bg, #353535);
+    --rfm-panel-alt: var(--comfy-menu-secondary-bg, #303030);
+    --rfm-input: var(--comfy-input-bg, #222);
+    --rfm-text: var(--fg-color, #fff);
+    --rfm-muted: var(--descrip-text, #aaa);
+    --rfm-border: var(--border-color, #4e4e4e);
+    --rfm-hover: var(--content-hover-bg, #464646);
+    position: fixed; inset: 0; z-index: 10001; background: #0009; color: var(--rfm-text); font: 14px system-ui, sans-serif;
+}
+.rfm-shell[hidden], .rfm-toast[hidden] { display: none !important; }
+.rfm-frame { position: absolute; inset: 3%; display: flex; flex-direction: column; background: var(--rfm-bg); border: 1px solid var(--rfm-border); border-radius: 12px; overflow: hidden; box-shadow: 0 20px 80px #000b; }
+.rfm-header { display: flex; align-items: center; gap: 18px; padding: 13px 22px; background: var(--rfm-panel); border-bottom: 1px solid var(--rfm-border); }
+.rfm-header strong { display: block; font-size: 18px; letter-spacing: .2px; }
+.rfm-header small { display: block; color: var(--rfm-muted); }
+.rfm-header .rfm-status { margin-left: auto; color: var(--rfm-muted); }
+.rfm-close { border: 0; background: transparent; color: var(--rfm-text); font-size: 28px; line-height: 1; cursor: pointer; }
+.rfm-layout { display: flex; min-height: 0; flex: 1; }
+.rfm-nav { width: 190px; flex: none; padding: 15px 10px; background: var(--rfm-panel-alt); border-right: 1px solid var(--rfm-border); overflow-y: auto; }
+.rfm-nav-item { width: 100%; display: block; text-align: left; border: 0; border-radius: 8px; padding: 10px 12px; margin-bottom: 3px; color: var(--rfm-text); background: transparent; cursor: pointer; font: inherit; }
+.rfm-nav-item:hover, .rfm-nav-item.active { background: var(--rfm-hover); }
+.rfm-nav-item.active { box-shadow: inset 3px 0 var(--rfm-text); }
+.rfm-main { flex: 1; min-width: 0; padding: 24px; overflow: auto; }
+.rfm-main h1 { margin: 0 0 20px; font-size: 26px; font-weight: 650; }
+.rfm-main h2 { margin: 0 0 14px; font-size: 18px; }
+.rfm-main h3 { margin: 18px 0 10px; font-size: 15px; color: var(--rfm-text); }
+.rfm-titlebar, .rfm-toolbar { display: flex; align-items: center; gap: 8px; }
+.rfm-titlebar { justify-content: space-between; }
+.rfm-titlebar h1 { margin: 0 0 16px; }
+.rfm-toolbar { margin-bottom: 12px; min-width: 0; }
+.rfm-wrap { flex-wrap: wrap; }
+.rfm-grow { flex: 1; min-width: 200px; }
+.rfm-button { border: 1px solid var(--rfm-border); border-radius: 8px; padding: 7px 10px; color: var(--rfm-text); background: var(--rfm-panel-alt); font: inherit; white-space: nowrap; cursor: pointer; }
+.rfm-button:hover { background: var(--rfm-hover); }
+.rfm-button.rfm-primary { border-color: var(--rfm-text); background: var(--rfm-input); font-weight: 600; }
+.rfm-button.rfm-primary:hover { background: var(--rfm-hover); }
+.rfm-button.rfm-danger { color: var(--error-text, #ff4444); border-color: var(--error-text, #ff4444); }
+.rfm-button.rfm-disabled { opacity: .45; }
+.rfm-button.rfm-icon { width: 34px; padding: 6px 0; font-size: 18px; }
+.rfm-input { min-width: 70px; max-width: 100%; border: 1px solid var(--rfm-border); border-radius: 8px; padding: 7px 9px; background: var(--rfm-input); color: var(--rfm-text); font: inherit; }
+.rfm-input[type="checkbox"] { min-width: auto; accent-color: var(--rfm-text); }
+.rfm-input.rfm-short { width: 155px; }
+.rfm-crumbs { display: flex; align-items: center; min-width: 0; overflow: auto; white-space: nowrap; }
+.rfm-crumb { border: 0; background: transparent; padding: 4px; color: var(--rfm-text); }
+.rfm-crumb:hover { text-decoration: underline; }
+.rfm-muted { color: var(--rfm-muted); }
+.rfm-selection { border-top: 1px solid var(--rfm-border); padding-top: 12px; flex-wrap: wrap; }
+.rfm-check { display: flex; align-items: center; gap: 8px; margin: 8px 0; color: var(--rfm-text); }
+.rfm-file-list { border: 1px solid var(--rfm-border); border-radius: 10px; overflow: hidden; }
+.rfm-file { display: grid; grid-template-columns: 24px 35px minmax(150px, 1fr) 110px 175px; align-items: center; gap: 12px; min-height: 48px; padding: 7px 12px; border-bottom: 1px solid var(--rfm-border); }
+.rfm-file:last-child { border-bottom: 0; }
+.rfm-file:hover, .rfm-file.selected { background: var(--rfm-hover); }
+.rfm-file-icon { font-size: 22px; }
+.rfm-name { overflow: hidden; text-overflow: ellipsis; text-align: left; border: 0; background: transparent; color: var(--rfm-text); cursor: pointer; font: inherit; }
+.rfm-name:hover { text-decoration: underline; }
+.rfm-file-list.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; border: 0; }
+.rfm-file-list.grid .rfm-file { display: flex; flex-direction: column; align-items: flex-start; min-height: 150px; border: 1px solid var(--rfm-border); border-radius: 10px; overflow: hidden; }
+.rfm-file-list.grid .rfm-name { width: 100%; }
+.rfm-thumb { width: 100%; height: 105px; object-fit: cover; border-radius: 6px; background: var(--rfm-input); }
+.rfm-context { position: fixed; z-index: 10010; min-width: 160px; padding: 5px; border: 1px solid var(--rfm-border); border-radius: 9px; background: var(--rfm-panel); box-shadow: 0 12px 40px #0009; }
+.rfm-context .rfm-button { display: block; width: 100%; text-align: left; border: 0; background: transparent; }
+.rfm-context .rfm-button:hover { background: var(--rfm-hover); }
+.rfm-card { min-width: 0; padding: 18px; margin-bottom: 18px; border: 1px solid var(--rfm-border); border-radius: 10px; background: var(--rfm-panel); }
+.rfm-node-picker { max-height: 180px; overflow: auto; padding: 8px 12px; margin-bottom: 12px; border: 1px solid var(--rfm-border); border-radius: 8px; background: var(--rfm-input); }
+.rfm-card > .rfm-button { margin: 8px 8px 8px 0; }
+.rfm-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.rfm-download-files { max-height: 310px; overflow: auto; border: 1px solid var(--rfm-border); border-radius: 8px; }
+.rfm-download-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--rfm-border); }
+.rfm-download-row .rfm-input[type="text"] { flex: 1; }
+.rfm-table { border: 1px solid var(--rfm-border); border-radius: 10px; overflow: hidden; }
+.rfm-model-row { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(90px, 1fr) 80px minmax(180px, 2fr) minmax(160px, 1fr); align-items: center; gap: 10px; padding: 11px; border-bottom: 1px solid var(--rfm-border); }
+.rfm-model-row.header { background: var(--rfm-panel-alt); font-weight: 700; }
+.rfm-model-row small { display: block; overflow-wrap: anywhere; color: var(--rfm-muted); }
+.rfm-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+.rfm-workflow-row, .rfm-dependency-row, .rfm-root-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--rfm-border); overflow-wrap: anywhere; }
+.rfm-workflow-row > span:first-child, .rfm-dependency-row > strong { flex: 1; }
+.rfm-workflow-row a { color: var(--rfm-text); text-decoration: underline; }
+.rfm-good { color: var(--rfm-text); }
+.rfm-bad { color: var(--error-text, #ff4444); }
+.rfm-task-row { padding: 14px; margin: 10px 0; border: 1px solid var(--rfm-border); border-radius: 10px; background: var(--rfm-panel-alt); }
+.rfm-task-top, .rfm-task-detail, .rfm-summary-line { display: flex; justify-content: space-between; gap: 12px; }
+.rfm-task-top { margin-bottom: 8px; }
+.rfm-task-detail { color: var(--rfm-muted); font-size: 12px; margin: 5px 0 12px; }
+.rfm-log-row { display: grid; grid-template-columns: 165px 80px 1fr; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--rfm-border); overflow-wrap: anywhere; }
+.rfm-log-list { max-height: 300px; overflow: auto; margin-top: 12px; }
+.rfm-progress { display: block; width: 100%; height: 10px; accent-color: var(--rfm-text); }
+.rfm-summary { margin-top: 12px; }
+.rfm-summary-line { padding: 7px 0; border-bottom: 1px solid var(--rfm-border); }
+.rfm-restore-row { display: grid; grid-template-columns: 24px minmax(120px, 1.2fr) 90px minmax(120px, 1fr) 110px minmax(120px, 1fr) auto; gap: 7px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--rfm-border); }
+.rfm-restore-row small { display: block; color: var(--rfm-muted); }
+.rfm-folder-cell { display: flex; gap: 5px; min-width: 0; }
+.rfm-folder-cell .rfm-input { min-width: 80px; width: 100%; }
+.rfm-picker-cover { position: fixed; inset: 0; z-index: 10020; display: grid; place-items: center; background: #000b; }
+.rfm-picker { width: min(580px, 94vw); max-height: 80vh; display: flex; flex-direction: column; color: var(--rfm-text); box-shadow: 0 20px 70px #000b; }
+.rfm-picker-list { min-height: 100px; overflow: auto; border: 1px solid var(--rfm-border); border-radius: 8px; margin: 8px 0 15px; }
+.rfm-picker-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--rfm-border); border-radius: 0; }
+.rfm-empty { padding: 30px; text-align: center; color: var(--rfm-muted); }
+.rfm-toast { position: absolute; right: 20px; bottom: 20px; max-width: 480px; padding: 12px 16px; border-radius: 9px; background: #1e6848; color: white; box-shadow: 0 10px 30px #0008; }
+.rfm-toast.error { background: #8d3333; }
+@media (max-width: 900px) {
+    .rfm-frame { inset: 1%; }
+    .rfm-nav { width: 125px; }
+    .rfm-nav-item { padding: 8px; font-size: 12px; }
+    .rfm-main { padding: 12px; }
+    .rfm-columns { grid-template-columns: 1fr; }
+    .rfm-file { grid-template-columns: 24px 30px minmax(90px, 1fr) 80px; }
+    .rfm-file > :last-child { display: none; }
+    .rfm-model-row { grid-template-columns: 2fr 1fr 1fr; }
+    .rfm-model-row > :nth-child(4), .rfm-model-row > :nth-child(5) { grid-column: 1 / -1; }
+    .rfm-restore-row { grid-template-columns: 24px 1fr 1fr; }
+}
