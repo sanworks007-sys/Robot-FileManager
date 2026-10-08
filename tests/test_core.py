@@ -1,17 +1,22 @@
 import asyncio
 import importlib
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
 import uuid
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from aiohttp import FormData, web
+from aiohttp.test_utils import TestClient, TestServer
 
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -44,6 +49,14 @@ class CoreTests(unittest.TestCase):
         cls.catalog = importlib.import_module("rfm.catalog")
         cls.backup = importlib.import_module("rfm.backup")
         cls.providers = importlib.import_module("rfm.providers")
+        cls.transfers = importlib.import_module("rfm.transfers")
+        cls.terminal = importlib.import_module("rfm.terminal")
+        cls.installer = importlib.import_module("rfm.installer")
+        server = types.ModuleType("server")
+        server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=web.RouteTableDef(),
+            prompt_queue=types.SimpleNamespace(get_tasks_remaining=lambda: 0)))
+        sys.modules["server"] = server
+        cls.routes = importlib.import_module("rfm.routes")
 
     @classmethod
     def tearDownClass(cls):
@@ -314,6 +327,284 @@ class CoreTests(unittest.TestCase):
         self.tasks.trash_action(item["id"], "restore")
         self.assertEqual(source.read_text(), "example")
 
+    def test_existing_download_is_skipped_without_network(self):
+        target = self.base / "models" / "existing.safetensors"
+        target.write_bytes(b"keep existing model")
+        with patch.object(self.tasks, "_download") as download:
+            task = self.tasks.queue_download("https://example.com/existing.safetensors", "models", "", target.name)
+        self.assertEqual(task.status, "skipped")
+        download.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"keep existing model")
+        self.assertEqual(task.result["size"], target.stat().st_size)
+
+    def test_pending_download_is_not_queued_twice_across_root_aliases(self):
+        entered = threading.Event()
+        finish = threading.Event()
+        calls = []
+        async def download(task, url, target, token):
+            calls.append(url)
+            entered.set()
+            finish.wait(5)
+            target.write_bytes(b"downloaded")
+            task.progress(10, 10)
+        with patch.object(self.tasks, "_download", download):
+            first = self.tasks.queue_download("https://example.com/pending.safetensors", "models", "checkpoints", "pending.safetensors")
+            try:
+                self.assertTrue(entered.wait(5))
+                second = self.tasks.queue_download("https://example.com/pending.safetensors", "model:checkpoints:0", "", "pending.safetensors")
+                self.assertEqual(second.status, "skipped")
+            finally:
+                finish.set()
+            self.wait_task(first)
+        self.assertEqual(len(calls), 1)
+
+    def test_transfer_history_retains_reusable_links_after_task_removal(self):
+        async def download(task, url, target, token):
+            target.write_bytes(b"history file")
+            task.progress(12, 12)
+        with patch.object(self.tasks, "_download", download):
+            task = self.tasks.queue_download("https://example.com/history.safetensors", "models", "", "history.safetensors")
+            self.wait_task(task)
+        self.tasks.TASKS.control(task.id, "remove")
+        item = next(item for item in self.transfers.history() if item["name"] == "history.safetensors")
+        self.assertEqual((item["status"], item["size"], item["root"], item["path"]), ("completed", 12, "models", "history.safetensors"))
+        self.assertEqual(item["url"], "https://example.com/history.safetensors")
+        self.assertTrue(item["reusable"])
+        self.assertEqual(self.transfers.history(), importlib.reload(self.transfers).history())
+
+    def test_transfer_history_redacts_signed_links(self):
+        self.transfers.record("download", "signed.bin", "models", "signed.bin", "https://example.com/signed.bin?token=private-value", "direct")
+        item = next(item for item in self.transfers.history() if item["name"] == "signed.bin")
+        self.assertEqual(item["url"], "https://example.com/signed.bin")
+        self.assertFalse(item["reusable"])
+        self.assertNotIn("private-value", json.dumps(item))
+
+    def test_delete_choice_overrides_old_default(self):
+        self.security.write_json(self.security.SETTINGS, {"trash": False}, private=True)
+        source = self.base / "models" / "trash-choice.safetensors"
+        direct = self.base / "models" / "delete-choice.safetensors"
+        source.write_bytes(b"trash")
+        direct.write_bytes(b"delete")
+        try:
+            self.wait_task(self.tasks.file_operation("delete", [{"root": "models", "path": source.name}], permanent=False))
+            self.wait_task(self.tasks.file_operation("delete", [{"root": "models", "path": direct.name}], permanent=True))
+            self.assertFalse(source.exists())
+            self.assertFalse(direct.exists())
+            trashed = [item for item in self.tasks.trash_list() if item["name"] in (source.name, direct.name)]
+            self.assertEqual([item["name"] for item in trashed], [source.name])
+            self.tasks.trash_action(trashed[0]["id"], "restore")
+            self.assertEqual(source.read_bytes(), b"trash")
+        finally:
+            self.security.write_json(self.security.SETTINGS, {"trash": True}, private=True)
+
+    def test_model_totals_refresh_and_deduplicate_roots(self):
+        target = self.base / "models/checkpoints/total.safetensors"
+        before = self.catalog.model_totals(True)
+        target.write_bytes(b"123456789")
+        after = self.catalog.model_totals(True)
+        self.assertEqual(after["count"], before["count"] + 1)
+        self.assertEqual(after["size"], before["size"] + 9)
+        target.unlink()
+        self.assertEqual(self.catalog.model_totals(True), before)
+
+    def test_resource_stats_re_read_disk_and_upload_history_has_local_link(self):
+        async def run():
+            application = web.Application()
+            application.add_routes(self.routes.routes)
+            async with TestClient(TestServer(application)) as client:
+                with patch.object(self.routes.shutil, "disk_usage", side_effect=[
+                        types.SimpleNamespace(total=100, used=20, free=80), types.SimpleNamespace(total=100, used=35, free=65)]):
+                    first = await (await client.get("/robot/system/stats?root=models")).json()
+                    second = await (await client.get("/robot/system/stats?root=models")).json()
+                self.assertEqual((first["disk"]["free"], second["disk"]["free"]), (80, 65))
+                self.assertIn("cpu", second)
+                self.assertIn("percent", second["ram"])
+                self.assertIn("size", second["models"])
+                form = FormData()
+                form.add_field("file", b"uploaded data", filename="history-upload.txt")
+                response = await client.post("/robot/files/upload?root=input&path=", data=form)
+                self.assertEqual(response.status, 200, await response.text())
+                data = await (await client.get("/robot/transfers")).json()
+                entry = next(item for item in data["transfers"] if item["name"] == "history-upload.txt")
+                self.assertEqual((entry["kind"], entry["status"], entry["size"], entry["path"]), ("upload", "completed", 13, "history-upload.txt"))
+                response = await client.get("/robot/files/download?root=input&path=history-upload.txt")
+                self.assertEqual(await response.read(), b"uploaded data")
+        asyncio.run(run())
+
+    def test_zip_upload_extract_and_download_in_chosen_folder(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("nested/readme.txt", "ZIP from PC")
+        destination = self.base / "input/zip-destination"
+        destination.mkdir()
+        async def run():
+            application = web.Application()
+            application.add_routes(self.routes.routes)
+            async with TestClient(TestServer(application)) as client:
+                form = FormData()
+                form.add_field("file", archive.getvalue(), filename="from-pc.zip", content_type="application/zip")
+                response = await client.post("/robot/files/upload?root=input&path=zip-destination", data=form)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertTrue((destination / "from-pc.zip").is_file())
+                response = await client.post("/robot/files/extract", json={"root": "input", "path": "zip-destination/from-pc.zip",
+                                             "destination_root": "output", "destination_folder": ""})
+                result = await response.json()
+                self.wait_task(self.tasks.TASKS.tasks[result["task"]])
+                self.assertEqual((self.base / "output/nested/readme.txt").read_text(), "ZIP from PC")
+                response = await client.get("/robot/files/download?root=input&path=zip-destination/from-pc.zip")
+                self.assertEqual(await response.read(), archive.getvalue())
+        asyncio.run(run())
+
+    def test_terminal_requires_linux_and_valid_working_folder(self):
+        with patch.object(self.terminal, "available", return_value=False), patch.object(self.terminal, "Command") as process:
+            with self.assertRaisesRegex(ValueError, "Linux"):
+                self.terminal.run("ls", "output", "")
+            process.assert_not_called()
+        with patch.object(self.terminal, "available", return_value=True), patch.object(self.terminal, "Command") as process:
+            with self.assertRaises(ValueError):
+                self.terminal.run("ls", "output", "../user")
+            process.assert_not_called()
+
+    def test_terminal_streams_output_and_uses_server_working_folder(self):
+        process = MagicMock()
+        process.stdout = io.BytesIO(b"hello from Linux\n")
+        process.wait.return_value = 0
+        launch = MagicMock(return_value=process)
+        subprocess_api = types.SimpleNamespace(Popen=launch, DEVNULL=-3, PIPE=-1, STDOUT=-2)
+        with patch.object(self.terminal, "available", return_value=True), patch.object(self.terminal.shutil, "which", return_value="/bin/bash"), \
+                patch.object(self.terminal, "subprocess", subprocess_api):
+            job = self.terminal.run("printf 'hello from Linux\\n'", "output", "")
+            deadline = time.time() + 5
+            while job.status == "running" and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(job.public()["status"], "completed")
+        self.assertEqual(job.public()["output"], "hello from Linux\n")
+        self.assertEqual(launch.call_args.args[0], ["/bin/bash", "-c", "printf 'hello from Linux\\n'"])
+        self.assertEqual(launch.call_args.kwargs["cwd"], str(self.base / "output"))
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+
+    def test_terminal_stop_signals_process_group(self):
+        process = MagicMock()
+        process.pid = 12345
+        process.stdout = io.BytesIO(b"")
+        process.wait.return_value = -15
+        subprocess_api = types.SimpleNamespace(Popen=MagicMock(return_value=process), DEVNULL=-3, PIPE=-1, STDOUT=-2)
+        with patch.object(self.terminal, "subprocess", subprocess_api), \
+                patch.object(self.terminal.os, "killpg", create=True) as kill, patch.object(self.terminal.threading, "Timer"):
+            command = self.terminal.Command("sleep 10", "output", "", self.base / "output")
+            command.stop()
+            kill.assert_called_once_with(12345, self.terminal.signal.SIGTERM)
+            command.read()
+            self.assertEqual(command.public()["status"], "cancelled")
+
+    def node_stage(self, files):
+        identifier = uuid.uuid4().hex
+        folder = self.installer.STAGING / identifier / "uploaded"
+        folder.mkdir(parents=True)
+        for name, contents in files.items():
+            path = folder / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+        return identifier
+
+    def test_node_zip_installs_requirements_and_checks_loaded_status(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("SampleNode-main/__init__.py", "NODE_CLASS_MAPPINGS = {}")
+            zipped.writestr("SampleNode-main/requirements.txt", "sample-package>=1\n")
+        identifier = self.node_stage({"SampleNode.zip": archive.getvalue()})
+        summary = self.installer.prepare(identifier)
+        self.assertEqual((summary["name"], summary["kind"], summary["exists"]), ("SampleNode", "folder", False))
+        with patch.object(self.installer, "run_pip", side_effect=[(0, "Installed sample-package"), (0, "No broken requirements")]) as pip:
+            result = self.wait_task(self.installer.install(identifier, summary["name"]))
+        self.assertTrue(result["installed"])
+        self.assertTrue(result["dependency_check"])
+        self.assertEqual(pip.call_args_list[0].args[0][:3], ["install", "--no-input", "-r"])
+        self.assertEqual(pip.call_args_list[1].args[0], ["check"])
+        self.assertTrue((self.base / "custom_nodes/SampleNode/__init__.py").is_file())
+        with patch.dict(sys.modules["nodes"].NODE_CLASS_MAPPINGS, {"Example": type("Example", (), {"RELATIVE_PYTHON_MODULE": "custom_nodes.SampleNode"})}):
+            item = next(item for item in self.installer.history() if item["name"] == "SampleNode")
+            self.assertEqual(item["loaded_nodes"], ["Example"])
+
+    def test_node_installer_accepts_direct_python_and_protects_existing_files(self):
+        identifier = self.node_stage({"single_node.py": b"NODE_CLASS_MAPPINGS = {}"})
+        summary = self.installer.prepare(identifier)
+        self.assertEqual(summary["kind"], "file")
+        self.wait_task(self.installer.install(identifier, "single_node.py"))
+        second = self.node_stage({"single_node.py": b"NODE_CLASS_MAPPINGS = {}\n# new copy"})
+        self.assertTrue(self.installer.prepare(second)["exists"])
+        with self.assertRaises(FileExistsError):
+            self.installer.install(second, "single_node.py")
+        self.assertEqual((self.base / "custom_nodes/single_node.py").read_bytes(), b"NODE_CLASS_MAPPINGS = {}")
+
+    def test_node_installer_rejects_unsafe_zip_and_invalid_python(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("../outside.py", "pass")
+        identifier = self.node_stage({"bad.zip": archive.getvalue()})
+        with self.assertRaises(ValueError):
+            self.installer.prepare(identifier)
+        invalid = self.node_stage({"bad.py": b"def broken(:"})
+        with self.assertRaisesRegex(ValueError, "syntax error"):
+            self.installer.prepare(invalid)
+
+    def test_node_requirements_failure_does_not_install_package(self):
+        identifier = self.node_stage({"FailNode/__init__.py": b"NODE_CLASS_MAPPINGS = {}", "FailNode/requirements.txt": b"missing-package"})
+        self.installer.prepare(identifier)
+        with patch.object(self.installer, "run_pip", return_value=(1, "No matching distribution")):
+            task = self.installer.install(identifier, "FailNode")
+            deadline = time.time() + 5
+            while task.status in ("waiting", "running") and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(task.status, "failed")
+        self.assertFalse((self.base / "custom_nodes/FailNode").exists())
+
+    def test_node_pip_uses_comfy_python_package_folder_and_redacted_output(self):
+        process = MagicMock()
+        process.stdout = io.StringIO("Installed package\nSource https://example.com/file?token=private-secret\n")
+        process.poll.return_value = 0
+        process.returncode = 0
+        launch = MagicMock(return_value=process)
+        subprocess_api = types.SimpleNamespace(Popen=launch, PIPE=-1, STDOUT=-2)
+        task = self.tasks.Task("install-node", "Requirements test")
+        folder = self.base / "custom_nodes"
+        with patch.object(self.installer, "subprocess", subprocess_api):
+            code, output = self.installer.run_pip(["install", "--no-input", "-r", "requirements.txt"], task, "Installing requirements", folder)
+        self.assertEqual(code, 0)
+        self.assertIn("Installed package", output)
+        self.assertNotIn("private-secret", output)
+        self.assertEqual(launch.call_args.args[0][:3], [sys.executable, "-m", "pip"])
+        self.assertEqual(launch.call_args.kwargs["cwd"], str(folder))
+
+    def test_node_folder_upload_preserves_paths_and_restart_is_confirmed_and_idle(self):
+        async def run():
+            application = web.Application()
+            application.add_routes(self.routes.routes)
+            async with TestClient(TestServer(application)) as client:
+                form = FormData()
+                form.add_field("file", b"NODE_CLASS_MAPPINGS = {}", filename="FolderNode/__init__.py")
+                form.add_field("file", b"value = 1", filename="FolderNode/nested/helper.py")
+                response = await client.post("/robot/custom-nodes/upload", data=form)
+                self.assertEqual(response.status, 200, await response.text())
+                summary = (await response.json())["package"]
+                self.assertEqual((summary["name"], summary["files"]), ("FolderNode", 2))
+                response = await client.post("/robot/custom-nodes/install", json={"id": summary["id"], "name": "FolderNode", "requirements": False})
+                result = await response.json()
+                self.wait_task(self.tasks.TASKS.tasks[result["task"]])
+                self.assertTrue((self.base / "custom_nodes/FolderNode/nested/helper.py").is_file())
+                response = await client.post("/robot/system/restart", json={})
+                self.assertEqual(response.status, 400)
+                queue = self.routes.PromptServer.instance.prompt_queue
+                with patch.object(queue, "get_tasks_remaining", return_value=1):
+                    response = await client.post("/robot/system/restart", json={"confirm_restart": True})
+                    self.assertEqual(response.status, 400)
+                with patch.object(self.installer, "restart_process") as restart:
+                    response = await client.post("/robot/system/restart", json={"confirm_restart": True})
+                    self.assertEqual(response.status, 200, await response.text())
+                    await asyncio.sleep(1.1)
+                    restart.assert_called_once_with()
+        asyncio.run(run())
+
     def test_trash_keeps_content_when_move_reports_failure(self):
         source = self.base / "output" / "keep.txt"
         source.write_text("keep", encoding="utf-8")
@@ -395,15 +686,8 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(workflow.is_file())
 
     def test_http_routes_smoke(self):
-        from aiohttp import web
-        from aiohttp.test_utils import TestClient, TestServer
-
-        server = types.ModuleType("server")
-        server.PromptServer = type("PromptServer", (), {"instance": types.SimpleNamespace(routes=web.RouteTableDef())})
-        sys.modules["server"] = server
-        importlib.import_module("rfm.routes")
         app = web.Application()
-        app.add_routes(server.PromptServer.instance.routes)
+        app.add_routes(self.routes.routes)
 
         async def exercise():
             async with TestServer(app) as test_server, TestClient(test_server) as client:

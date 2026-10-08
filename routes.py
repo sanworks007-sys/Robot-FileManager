@@ -3,24 +3,27 @@ import json
 import mimetypes
 import os
 import shutil
+import time
 import uuid
 import zipfile
 from collections import deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
+import psutil
 from aiohttp import ClientError, web
 from server import PromptServer
 
-from . import backup, catalog, providers
+from . import backup, catalog, installer, providers, terminal, transfers
 from .security import DATA, SETTINGS, child, public_source_url, resolve, roots, settings, write_json
 from .tasks import TASKS, Stopped, error_text, extract_archive, file_operation, measure_size, queue_download, trash_action, trash_list
 
 
 routes = PromptServer.instance.routes
 EVENTS = deque(maxlen=500)
+SERVER_STARTED = time.time()
 
 
 def log_event(kind, message):
@@ -64,6 +67,47 @@ async def list_roots(request):
             usage = shutil.disk_usage(path)
             available.append({"id": name, "path": str(path), "total": usage.total, "used": usage.used, "free": usage.free})
     return web.json_response({"roots": available, "settings": settings()})
+
+
+@routes.get("/robot/system/stats")
+@guarded
+async def system_stats(request):
+    root_name = request.query.get("root", "output")
+    folder = resolve(root_name, request.query.get("path", ""), must_exist=True)
+    def collect():
+        disk = shutil.disk_usage(folder)
+        memory = psutil.virtual_memory()
+        return {"root": root_name, "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
+                "cpu": psutil.cpu_percent(), "ram": {"total": memory.total, "used": memory.total - memory.available, "percent": memory.percent},
+                "models": catalog.model_totals(request.query.get("refresh_models") == "1")}
+    return web.json_response(await asyncio.to_thread(collect))
+
+
+@routes.get("/robot/transfers")
+@guarded
+async def transfer_history(request):
+    return web.json_response({"transfers": await asyncio.to_thread(transfers.history)})
+
+
+@routes.get("/robot/terminal")
+@guarded
+async def terminal_status(request):
+    return web.json_response({"available": terminal.available(), "commands": terminal.snapshot()})
+
+
+@routes.post("/robot/terminal/run")
+@guarded
+async def terminal_run(request):
+    data = await body(request)
+    job = await asyncio.to_thread(terminal.run, data["command"], data["root"], data.get("path", ""))
+    return web.json_response({"command": job.public()})
+
+
+@routes.post("/robot/terminal/stop")
+@guarded
+async def terminal_stop(request):
+    data = await body(request)
+    return web.json_response({"command": terminal.stop(data["id"]).public()})
 
 
 @routes.get("/robot/files/list")
@@ -120,7 +164,8 @@ async def action(request):
     sources = data.get("sources", [])
     if not isinstance(sources, list) or not 1 <= len(sources) <= 1000:
         raise ValueError("Select 1 to 1000 files")
-    task = file_operation(action_name, sources, data.get("destination"), data.get("name"), bool(data.get("permanent", False)))
+    permanent = bool(data["permanent"]) if "permanent" in data else None
+    task = file_operation(action_name, sources, data.get("destination"), data.get("name"), permanent)
     return web.json_response({"task": task.id})
 
 
@@ -148,6 +193,7 @@ async def download_file(request):
     response = web.FileResponse(path)
     response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(path.name)}"
     response.headers["X-Content-Type-Options"] = "nosniff"
+    transfers.record("export", path.name, request.query["root"], request.query["path"], size=path.stat().st_size, status="requested")
     return response
 
 
@@ -182,6 +228,7 @@ async def upload_file(request):
             target = child(root_name, folder, part.filename)
             TASKS.reserve(target)
             temporary = target.with_name(target.name + ".robot-upload-" + uuid.uuid4().hex)
+            transfer = transfers.record("upload", target.name, root_name, target.relative_to(roots()[root_name]).as_posix(), status="running")
             try:
                 if target.exists():
                     raise FileExistsError(target.name)
@@ -195,6 +242,13 @@ async def upload_file(request):
                     raise FileExistsError(target.name)
                 os.replace(temporary, target)
                 names.append(target.name)
+                transfers.update(transfer, "completed", target.stat().st_size)
+            except Stopped:
+                transfers.update(transfer, "cancelled")
+                raise
+            except Exception:
+                transfers.update(transfer, "failed")
+                raise
             finally:
                 temporary.unlink(missing_ok=True)
                 TASKS.release(target)
@@ -255,6 +309,7 @@ async def enqueue(request):
     if not isinstance(items, list) or not 1 <= len(items) <= 100:
         raise ValueError("Select 1 to 100 files")
     results = []
+    skipped = []
     errors = []
     for item in items:
         if not isinstance(item, dict):
@@ -265,10 +320,13 @@ async def enqueue(request):
             token = providers.credential(platform) if platform in ("huggingface", "civitai") else None
             task = queue_download(item["url"], item["root"], item.get("folder", ""), item["filename"], platform, token,
                                   {"model_type": item.get("model_type"), "model_name": item.get("model_name"), "sha256": item.get("sha256")})
-            results.append(task.id)
+            if task.status == "skipped":
+                skipped.append({"name": task.name, "reason": task.result["skipped"], "task": task.id})
+            else:
+                results.append(task.id)
         except (ValueError, KeyError, OSError) as error:
             errors.append({"name": str(item.get("filename", "unknown"))[:100], "error": error_text(error)})
-    return web.json_response({"tasks": results, "errors": errors})
+    return web.json_response({"tasks": results, "skipped": skipped, "errors": errors})
 
 
 @routes.get("/robot/tasks")
@@ -356,6 +414,69 @@ async def workflows(request):
 @guarded
 async def installed_custom_nodes(request):
     return web.json_response({"packages": await asyncio.to_thread(catalog.installed_custom_nodes)})
+
+
+@routes.post("/robot/custom-nodes/upload")
+@guarded
+async def upload_custom_node(request):
+    identifier = uuid.uuid4().hex
+    folder = installer.STAGING / identifier
+    uploaded = folder / "uploaded"
+    uploaded.mkdir(parents=True)
+    seen = set()
+    try:
+        reader = await request.multipart()
+        while part := await reader.next():
+            if not part.filename:
+                continue
+            target = installer.upload_path(uploaded, unquote(part.filename))
+            if target is None:
+                continue
+            key = target.relative_to(uploaded).as_posix().casefold()
+            if key in seen or len(seen) >= 100000:
+                raise ValueError("Duplicate upload path or too many node files")
+            seen.add(key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                while chunk := await part.read_chunk(4 * 1024 * 1024):
+                    if shutil.disk_usage(folder).free < len(chunk):
+                        raise OSError("Insufficient space for this upload")
+                    output.write(chunk)
+        if not seen:
+            raise ValueError("Choose a ZIP, Python file, or custom node folder")
+        summary = await asyncio.to_thread(installer.prepare, identifier)
+        return web.json_response({"package": summary})
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+
+@routes.post("/robot/custom-nodes/install")
+@guarded
+async def install_uploaded_custom_node(request):
+    data = await body(request)
+    task = installer.install(data["id"], data["name"], bool(data.get("requirements", True)))
+    return web.json_response({"task": task.id})
+
+
+@routes.get("/robot/custom-nodes/install-history")
+@guarded
+async def custom_node_install_history(request):
+    return web.json_response({"started": SERVER_STARTED, "installs": await asyncio.to_thread(installer.history)})
+
+
+@routes.post("/robot/system/restart")
+@guarded
+async def restart_server(request):
+    data = await body(request)
+    if data.get("confirm_restart") is not True:
+        raise ValueError("Confirm the ComfyUI restart")
+    if PromptServer.instance.prompt_queue.get_tasks_remaining() or any(
+            task["status"] in ("waiting", "running", "pausing", "cancelling") for task in TASKS.snapshot()) or any(
+            job["status"] in ("running", "stopping") for job in terminal.snapshot()):
+        raise ValueError("Finish running or queued workflows, file tasks, and commands before restarting ComfyUI")
+    asyncio.get_running_loop().call_later(1, installer.restart_process)
+    return web.json_response({"restarting": True, "started": SERVER_STARTED})
 
 
 @routes.post("/robot/custom-nodes/install-requirements")

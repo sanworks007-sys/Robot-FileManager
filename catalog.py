@@ -3,6 +3,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -17,6 +19,8 @@ DB = DATA / "models.sqlite3"
 MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pt2", ".pth", ".pkl", ".bin", ".gguf", ".onnx", ".sft"}
 MODEL_PATTERN = re.compile(r"(?<!\w)([^\s\"'<>|]+\.(?:safetensors|ckpt|pt2?|pth|pkl|bin|gguf|onnx|sft))\b", re.I)
 EMBEDDING_PATTERN = re.compile(r"\bembedding:([\w .-]+)", re.I)
+SUMMARY_LOCK = threading.Lock()
+SUMMARY = {"updated": 0, "count": 0, "size": 0}
 
 
 @contextmanager
@@ -94,6 +98,14 @@ def scan_models():
                               "type": stored_type or model_type(path, category), "size": stat.st_size, "modified": stat.st_mtime,
                               "sha256": sha, "source_platform": platform, "source_url": url, "model_name": model_name}
     return sorted(found.values(), key=lambda item: (item["type"], item["name"].lower()))
+
+
+def model_totals(refresh=False):
+    with SUMMARY_LOCK:
+        if refresh or time.monotonic() - SUMMARY["updated"] > 10:
+            models = scan_models()
+            SUMMARY.update(updated=time.monotonic(), count=len(models), size=sum(item["size"] for item in models))
+        return {"count": SUMMARY["count"], "size": SUMMARY["size"]}
 
 
 def hash_model(root_name, relative):

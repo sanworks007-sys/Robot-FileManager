@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from .security import DATA, PRIVATE, child, download_url, inside, public_url, read_json, reject_symlinks, relative_path, resolve, roots, safe_url, settings, write_json
+from . import transfers
 
 
 class Stopped(Exception):
@@ -54,6 +55,8 @@ class Task:
         self.updated = self.created
         self.cancel = threading.Event()
         self.result = None
+        self.transfer = None
+        self.target = None
 
     def check(self):
         if self.cancel.is_set():
@@ -103,9 +106,15 @@ class TaskManager:
         with self.lock:
             return [task.public() for task in sorted(self.tasks.values(), key=lambda item: item.created, reverse=True)]
 
-    def add(self, kind, name, runner):
+    def add(self, kind, name, runner, transfer=None, target=None):
         task = Task(kind, name, runner)
+        task.transfer = transfer
+        task.target = target
         with self.lock:
+            if target and any(item.target == target and item.status in ("waiting", "running", "pausing", "paused", "cancelling")
+                              for item in self.tasks.values()):
+                task.status = "skipped"
+                task.result = {"skipped": "Download already queued; resume the existing task if paused"}
             self.tasks[task.id] = task
             if len(self.tasks) > 500:
                 for old in sorted(self.tasks.values(), key=lambda item: item.created):
@@ -113,7 +122,23 @@ class TaskManager:
                         del self.tasks[old.id]
                         if len(self.tasks) <= 400:
                             break
-        self.executor.submit(self._run, task)
+        if task.status == "skipped":
+            if transfer:
+                transfers.update(transfer, "skipped")
+            self.persist()
+        else:
+            self.executor.submit(self._run, task)
+        return task
+
+    def skipped(self, kind, name, result, transfer=None):
+        task = Task(kind, name)
+        task.status = "skipped"
+        task.result = result
+        with self.lock:
+            self.tasks[task.id] = task
+        if transfer:
+            transfers.update(transfer, "skipped", result.get("size"))
+        self.persist()
         return task
 
     def external(self, kind, name):
@@ -127,15 +152,19 @@ class TaskManager:
         if not task.cancel.is_set():
             task.status = "running"
         task.updated = time.time()
+        if task.transfer:
+            transfers.update(task.transfer, task.status)
         try:
             task.result = task.runner(task)
-            task.status = "completed"
+            task.status = "skipped" if task.kind == "download" and task.result and task.result.get("skipped") else "completed"
         except Stopped:
             task.status = "paused" if task.status == "pausing" else "cancelled"
         except Exception as error:
             task.error = error_text(error)
             task.status = "failed"
         task.updated = time.time()
+        if task.transfer:
+            transfers.update(task.transfer, task.status, task.result.get("size") if task.result else None)
         if task.status != "paused":
             self.persist()
 
@@ -302,7 +331,7 @@ def transfer_directory(source, target, task):
         shutil.copystat(original, copied_folder)
 
 
-def file_operation(action, sources, destination=None, name=None, permanent=False):
+def file_operation(action, sources, destination=None, name=None, permanent=None):
     def run(task):
         items = [(item["root"], item["path"], resolve(item["root"], item["path"], must_exist=True)) for item in sources]
         if action in ("copy", "move", "duplicate", "rename"):
@@ -336,7 +365,7 @@ def file_operation(action, sources, destination=None, name=None, permanent=False
                 else:
                     shutil.move(str(source), str(target))
             elif action == "delete":
-                if settings()["trash"] and not permanent:
+                if permanent is False or permanent is None and settings()["trash"]:
                     trash_item(root_name, relative, source)
                 elif source.is_dir():
                     shutil.rmtree(source)
@@ -455,6 +484,8 @@ async def _download(task, url, target, token=None):
                         task.progress(count, total, started, offset)
                 if total is not None and count != total:
                     raise OSError("Download ended before the expected size")
+                if target.exists():
+                    raise FileExistsError(target.name)
                 os.replace(partial, target)
                 metadata_path.unlink(missing_ok=True)
                 return
@@ -467,13 +498,19 @@ def queue_download(url, root_name, folder, filename, platform="direct", token=No
     if expected and (not isinstance(expected, str) or len(expected) != 64 or any(char not in "0123456789abcdefABCDEF" for char in expected)):
         raise ValueError("Invalid expected SHA256")
     target = child(root_name, folder, filename)
+    relative = target.relative_to(roots()[root_name]).as_posix()
+    transfer = transfers.record("download", filename, root_name, relative, url, platform, metadata)
     if target.exists():
-        raise FileExistsError(filename)
+        if not target.is_file():
+            transfers.update(transfer, "failed")
+            raise FileExistsError("Destination is a folder: " + filename)
+        return TASKS.skipped("download", filename, {"root": root_name, "path": relative, "size": target.stat().st_size,
+                                                   "skipped": "File already exists"}, transfer)
     def run(task):
         TASKS.reserve(target)
         try:
             if target.exists():
-                raise FileExistsError(filename)
+                return {"root": root_name, "path": relative, "size": target.stat().st_size, "skipped": "File already exists"}
             asyncio.run(_download(task, url, target, token))
             from .catalog import save_model_source
             if expected:
@@ -489,7 +526,13 @@ def queue_download(url, root_name, folder, filename, platform="direct", token=No
                     save_model_source(target, platform, url, metadata or {})
                 except (OSError, ValueError, sqlite3.Error) as error:
                     task.error = "Download completed, but source metadata was not saved: " + error_text(error)
-            return {"root": root_name, "path": str((Path(folder) / filename).as_posix())}
+            return {"root": root_name, "path": relative, "size": target.stat().st_size}
+        except FileExistsError:
+            if not target.is_file():
+                raise
+            target.with_name(target.name + ".robot-part").unlink(missing_ok=True)
+            target.with_name(target.name + ".robot-part.json").unlink(missing_ok=True)
+            return {"root": root_name, "path": relative, "size": target.stat().st_size, "skipped": "File already exists"}
         except Stopped:
             if task.status == "cancelling":
                 target.with_name(target.name + ".robot-part").unlink(missing_ok=True)
@@ -497,4 +540,4 @@ def queue_download(url, root_name, folder, filename, platform="direct", token=No
             raise
         finally:
             TASKS.release(target)
-    return TASKS.add("download", filename, run)
+    return TASKS.add("download", filename, run, transfer, target)
