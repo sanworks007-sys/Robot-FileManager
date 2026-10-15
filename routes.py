@@ -16,7 +16,7 @@ import psutil
 from aiohttp import ClientError, web
 from server import PromptServer
 
-from . import backup, catalog, installer, providers, terminal, transfers
+from . import backup, catalog, installer, migration, providers, storage, terminal, transfers
 from .security import DATA, SETTINGS, child, public_source_url, resolve, roots, settings, write_json
 from .tasks import TASKS, Stopped, error_text, extract_archive, file_operation, measure_size, queue_download, trash_action, trash_list
 
@@ -318,8 +318,9 @@ async def enqueue(request):
         try:
             platform = providers.detect(item["url"])
             token = providers.credential(platform) if platform in ("huggingface", "civitai") else None
+            authorization = providers.authorization_headers(item["url"], item.get("auth_profile"))
             task = queue_download(item["url"], item["root"], item.get("folder", ""), item["filename"], platform, token,
-                                  {"model_type": item.get("model_type"), "model_name": item.get("model_name"), "sha256": item.get("sha256")})
+                                  {"model_type": item.get("model_type"), "model_name": item.get("model_name"), "sha256": item.get("sha256")}, authorization=authorization)
             if task.status == "skipped":
                 skipped.append({"name": task.name, "reason": task.result["skipped"], "task": task.id})
             else:
@@ -586,7 +587,8 @@ async def logs(request):
 @routes.get("/robot/settings")
 @guarded
 async def get_settings(request):
-    return web.json_response({"settings": settings(), "credentials": {name: bool(providers.credential(name)) for name in ("huggingface", "civitai")}})
+    return web.json_response({"settings": settings(), "credentials": {name: bool(providers.credential(name)) for name in ("huggingface", "civitai")},
+                              "auth_profiles": providers.auth_profiles()})
 
 
 @routes.post("/robot/settings")
@@ -598,6 +600,8 @@ async def set_settings(request):
         current["trash"] = bool(data["trash"])
     if "export_ttl_hours" in data:
         current["export_ttl_hours"] = min(168, max(1, int(data["export_ttl_hours"])))
+    if "auto_install_manager" in data:
+        current["auto_install_manager"] = bool(data["auto_install_manager"])
     write_json(SETTINGS, current, private=True)
     return web.json_response({"settings": current})
 
@@ -608,6 +612,73 @@ async def credential(request):
     data = await body(request)
     providers.set_credential(data["platform"], data.get("token", ""))
     return web.json_response({"configured": bool(providers.credential(data["platform"]))})
+
+
+@routes.post("/robot/settings/credential/test")
+@guarded
+async def test_credential(request):
+    data = await body(request)
+    return web.json_response(await providers.test_access(data["platform"]))
+
+
+@routes.post("/robot/settings/authorization")
+@guarded
+async def save_authorization(request):
+    data = await body(request)
+    providers.set_auth_profile(data["name"], data.get("host", ""), data["method"], data.get("secret", ""), data.get("username", ""), data.get("header", "Authorization"))
+    return web.json_response({"profiles": providers.auth_profiles()})
+
+
+@routes.post("/robot/browser/search")
+@guarded
+async def browser_search(request):
+    data = await body(request)
+    return web.json_response(await providers.browse_models(data["platform"], data.get("query", ""), data.get("page", 1)))
+
+
+@routes.post("/robot/custom-nodes/github")
+@guarded
+async def install_github_node(request):
+    data = await body(request)
+    task = installer.install_github(data["repository"], data.get("name") or None, data.get("revision") or None, bool(data.get("requirements", True)))
+    return web.json_response({"task": task.id})
+
+
+@routes.post("/robot/setup")
+@guarded
+async def setup_manager(request):
+    data = await body(request)
+    current = settings()
+    present = installer.manager_present()
+    if present or not current["auto_install_manager"] or current["manager_setup_attempted"] and not data.get("retry"):
+        return web.json_response({"present": present, "attempted": current["manager_setup_attempted"]})
+    current["manager_setup_attempted"] = True
+    write_json(SETTINGS, current, private=True)
+    task = installer.install_github(installer.MANAGER_REPOSITORY, "comfyui-manager")
+    return web.json_response({"task": task.id, "present": False})
+
+
+@routes.get("/robot/storage/preview")
+@guarded
+async def storage_preview(request):
+    return web.json_response(await asyncio.to_thread(storage.preview_cleanup))
+
+
+@routes.post("/robot/storage/cleanup")
+@guarded
+async def storage_cleanup(request):
+    data = await body(request)
+    if data.get("confirm") is not True:
+        raise ValueError("Confirm permanent storage cleanup")
+    task = storage.clean(data.get("groups", []), bool(data.get("recycle_bin", False)))
+    return web.json_response({"task": task.id})
+
+
+@routes.post("/robot/backup/migrate")
+@guarded
+async def migrate_workspace(request):
+    data = await body(request)
+    return web.json_response({"task": migration.restore(data["import_id"], data).id})
 
 
 backup.schedule_cleanup()

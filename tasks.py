@@ -25,7 +25,7 @@ class Stopped(Exception):
 
 def error_text(error):
     message = re.sub(r"https?://[^\s]+", lambda match: download_url(match.group(0)), str(error))
-    return re.sub(r"Bearer\s+[^\s]+", "Bearer [redacted]", message, flags=re.I)[:400]
+    return re.sub(r"(Bearer|Basic)\s+[^\s]+", r"\1 [redacted]", message, flags=re.I)[:400]
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -74,7 +74,7 @@ class Task:
         return {"id": self.id, "kind": self.kind, "name": self.name, "status": self.status, "bytes": self.bytes,
                 "total": self.total, "speed": self.speed, "error": self.error, "created": self.created,
                 "updated": self.updated, "result": self.result,
-                "retryable": self.runner is not None and self.kind in ("download", "hash", "size", "backup", "zip")}
+                "retryable": self.runner is not None and self.kind in ("download", "hash", "size", "backup", "zip", "migration")}
 
 
 class TaskManager:
@@ -111,6 +111,8 @@ class TaskManager:
         task.transfer = transfer
         task.target = target
         with self.lock:
+            if any(item.kind == "cleanup" and item.status in ("waiting", "running") for item in self.tasks.values()):
+                raise ValueError("Wait for storage cleanup to finish before starting another file task")
             if target and any(item.target == target and item.status in ("waiting", "running", "pausing", "paused", "cancelling")
                               for item in self.tasks.values()):
                 task.status = "skipped"
@@ -145,6 +147,8 @@ class TaskManager:
         task = Task(kind, name)
         task.status = "running"
         with self.lock:
+            if any(item.kind == "cleanup" and item.status in ("waiting", "running") for item in self.tasks.values()):
+                raise ValueError("Wait for storage cleanup to finish before uploading files")
             self.tasks[task.id] = task
         return task
 
@@ -156,7 +160,7 @@ class TaskManager:
             transfers.update(task.transfer, task.status)
         try:
             task.result = task.runner(task)
-            task.status = "skipped" if task.kind == "download" and task.result and task.result.get("skipped") else "completed"
+            task.status = "failed" if task.result and task.result.get("needs_attention") else "skipped" if task.kind == "download" and task.result and task.result.get("skipped") else "completed"
         except Stopped:
             task.status = "paused" if task.status == "pausing" else "cancelled"
         except Exception as error:
@@ -341,6 +345,7 @@ def file_operation(action, sources, destination=None, name=None, permanent=None)
             if not folder.is_dir():
                 raise ValueError("Destination is not a folder")
         count = 0
+        disks = {}
         for root_name, relative, source in items:
             task.check()
             reject_symlinks(source)
@@ -365,17 +370,29 @@ def file_operation(action, sources, destination=None, name=None, permanent=None)
                 else:
                     shutil.move(str(source), str(target))
             elif action == "delete":
+                with TASKS.lock:
+                    if any(inside(target, source) for target in TASKS.reserved) or any(
+                            other.target and inside(other.target, source) and other.status in ("waiting", "running", "paused", "pausing", "cancelling")
+                            for other in TASKS.tasks.values()):
+                        raise ValueError("Stop the download or file operation using this path before deleting it")
+                parent = source.parent
+                disks.setdefault(parent.stat().st_dev, (parent, shutil.disk_usage(parent).free))
                 if permanent is False or permanent is None and settings()["trash"]:
                     trash_item(root_name, relative, source)
                 elif source.is_dir():
                     shutil.rmtree(source)
                 else:
                     source.unlink()
+                if source.exists():
+                    raise OSError("Deletion did not remove the file from disk")
             else:
                 raise ValueError("Unknown file operation")
             count += 1
             task.progress(count, len(items))
-        return {"count": count}
+        result = {"count": count}
+        if action == "delete":
+            result.update(permanent=bool(permanent), free_space_change=sum(shutil.disk_usage(parent).free - before for parent, before in disks.values()))
+        return result
     return TASKS.add(action, f"{action.title()} {len(sources)} item(s)", run)
 
 
@@ -425,7 +442,7 @@ def trash_action(item_id, action):
         raise ValueError("Unknown trash action")
 
 
-async def _download(task, url, target, token=None):
+async def _download(task, url, target, token=None, authorization=None):
     partial = target.with_name(target.name + ".robot-part")
     metadata_path = target.with_name(target.name + ".robot-part.json")
     if partial.is_symlink():
@@ -449,6 +466,8 @@ async def _download(task, url, target, token=None):
                 headers["If-Range"] = partial_info["etag"]
             if token and urlsplit(current).hostname == urlsplit(url).hostname:
                 headers["Authorization"] = f"Bearer {token}"
+            if authorization and urlsplit(current).netloc.lower() == urlsplit(url).netloc.lower():
+                headers.update(authorization)
             async with session.get(current, headers=headers, allow_redirects=False) as response:
                 if response.status in (301, 302, 303, 307, 308):
                     from urllib.parse import urljoin
@@ -492,7 +511,7 @@ async def _download(task, url, target, token=None):
         raise ValueError("Too many download redirects")
 
 
-def queue_download(url, root_name, folder, filename, platform="direct", token=None, metadata=None):
+def queue_download(url, root_name, folder, filename, platform="direct", token=None, metadata=None, *, authorization=None, task=None):
     safe_url(url)
     expected = (metadata or {}).get("sha256")
     if expected and (not isinstance(expected, str) or len(expected) != 64 or any(char not in "0123456789abcdefABCDEF" for char in expected)):
@@ -504,14 +523,17 @@ def queue_download(url, root_name, folder, filename, platform="direct", token=No
         if not target.is_file():
             transfers.update(transfer, "failed")
             raise FileExistsError("Destination is a folder: " + filename)
-        return TASKS.skipped("download", filename, {"root": root_name, "path": relative, "size": target.stat().st_size,
-                                                   "skipped": "File already exists"}, transfer)
+        result = {"root": root_name, "path": relative, "size": target.stat().st_size, "skipped": "File already exists"}
+        if task is not None:
+            transfers.update(transfer, "skipped", result["size"])
+            return result
+        return TASKS.skipped("download", filename, result, transfer)
     def run(task):
         TASKS.reserve(target)
         try:
             if target.exists():
                 return {"root": root_name, "path": relative, "size": target.stat().st_size, "skipped": "File already exists"}
-            asyncio.run(_download(task, url, target, token))
+            asyncio.run(_download(task, url, target, token, authorization) if authorization else _download(task, url, target, token))
             from .catalog import save_model_source
             if expected:
                 digest = hashlib.sha256()
@@ -540,4 +562,12 @@ def queue_download(url, root_name, folder, filename, platform="direct", token=No
             raise
         finally:
             TASKS.release(target)
+    if task is not None:
+        try:
+            result = run(task)
+            transfers.update(transfer, "completed", result.get("size"))
+            return result
+        except Exception:
+            transfers.update(transfer, "failed")
+            raise
     return TASKS.add("download", filename, run, transfer, target)

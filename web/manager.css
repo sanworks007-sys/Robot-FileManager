@@ -1,5 +1,7 @@
-.rfm-sidebar-launch { cursor: pointer; color: inherit; }
-.rfm-sidebar-content { display: flex; flex-direction: column; align-items: center; gap: 8px; font: 10px system-ui, sans-serif; }
+.rfm-sidebar-launch { display: flex !important; align-items: center; justify-content: center; cursor: pointer; color: inherit; background: transparent; border: 0; box-shadow: none; overflow: visible !important; height: auto !important; min-height: 52px; min-width: 42px; flex-shrink: 0; padding: 6px 4px !important; }
+.rfm-sidebar-launch:hover { background: var(--content-hover-bg, #8883); }
+.rfm-sidebar-content { display: flex; width: 100%; height: auto; min-height: 40px; flex: none; flex-direction: column; justify-content: center; align-items: center; gap: 4px; line-height: 14px; font: 10px system-ui, sans-serif; overflow: visible; }
+.rfm-sidebar-content svg { display: block; flex: none; width: 22px; height: 22px; overflow: visible; }
 .rfm-shell, .rfm-shell * { box-sizing: border-box; }
 .rfm-shell {
     --rfm-bg: var(--bg-color, #202020);
@@ -13,6 +15,7 @@
     position: fixed; inset: 0; z-index: 10001; background: #0009; color: var(--rfm-text); font: 14px system-ui, sans-serif;
 }
 .rfm-shell[hidden], .rfm-toast[hidden] { display: none !important; }
+.rfm-shell a { color: var(--link-color, #8dcaff); }
 .rfm-frame { position: absolute; inset: 3%; display: flex; flex-direction: column; background: var(--rfm-bg); border: 1px solid var(--rfm-border); border-radius: 12px; overflow: hidden; box-shadow: 0 20px 80px #000b; }
 .rfm-header { display: flex; align-items: center; gap: 18px; padding: 13px 22px; background: var(--rfm-panel); border-bottom: 1px solid var(--rfm-border); }
 .rfm-header strong { display: block; font-size: 18px; letter-spacing: .2px; }
@@ -134,6 +137,20 @@
 .rfm-empty { padding: 30px; text-align: center; color: var(--rfm-muted); }
 .rfm-toast { position: absolute; right: 20px; bottom: 20px; max-width: 480px; padding: 12px 16px; border-radius: 9px; background: #1e6848; color: white; box-shadow: 0 10px 30px #0008; }
 .rfm-toast.error { background: #8d3333; }
+.rfm-browser-frame { display: block; width: 100%; height: 65vh; min-height: 320px; margin-top: 16px; background: white; border: 1px solid var(--rfm-border); border-radius: 8px; }
+.rfm-browser-frame[hidden] { display: none; }
+.rfm-browser-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; margin-top: 16px; }
+.rfm-model-card { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.rfm-model-card h2 { font-size: 16px; }
+.rfm-model-card img { width: 100%; height: 180px; object-fit: cover; border-radius: 6px; }
+.rfm-model-card .rfm-button { margin: 4px 4px 0 0; }
+.rfm-import-group { margin: 16px 0; max-height: 320px; overflow: auto; }
+.rfm-import-group summary { cursor: pointer; font-weight: 600; padding: 8px 0; }
+.rfm-import-group .rfm-check, .rfm-import-item .rfm-check { overflow-wrap: anywhere; }
+.rfm-import-item { padding: 12px 0; border-bottom: 1px solid var(--rfm-border); }
+.rfm-import-item small { display: block; margin-top: 6px; }
+.rfm-import-item .rfm-toolbar { margin-top: 8px; }
+.rfm-import-item .rfm-input { max-width: 100%; }
 @media (max-width: 900px) {
     .rfm-frame { inset: 1%; }
     .rfm-nav { width: 125px; }

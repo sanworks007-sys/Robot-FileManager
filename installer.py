@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import os
 import re
 import shutil
@@ -10,11 +11,12 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import nodes
 
-from .security import DATA, child, read_json, relative_path, resolve, write_json
-from .tasks import TASKS, error_text
+from .security import DATA, child, read_json, reject_symlinks, relative_path, resolve, safe_url, write_json
+from .tasks import TASKS, _download, error_text
 
 
 STAGING = DATA / "node_uploads"
@@ -22,6 +24,13 @@ STAGING.mkdir(exist_ok=True)
 HISTORY = DATA / "node_installs.json"
 HISTORY_LOCK = threading.Lock()
 SKIP_FOLDERS = {".git", "__pycache__", ".venv", "venv", "node_modules", "__MACOSX"}
+
+
+def remove_readonly(function, path, error):
+    if os.name != "nt" or not isinstance(error[1], PermissionError):
+        raise error[1]
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    function(path)
 
 
 def upload_path(folder, filename):
@@ -116,10 +125,10 @@ def describe(summary):
     return result
 
 
-def run_pip(arguments, task, label, cwd):
+def _run_command(command, task, label, cwd, env=None):
     task.result = {"stage": label, "output": ""}
-    process = subprocess.Popen([sys.executable, "-m", "pip", "--disable-pip-version-check", *arguments],
-                               cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace")
     def read_output():
         for line in process.stdout:
             task.result["output"] = (task.result["output"] + error_text(line) + "\n")[-16000:]
@@ -130,7 +139,7 @@ def run_pip(arguments, task, label, cwd):
         while process.poll() is None:
             task.check()
             if time.monotonic() > deadline:
-                raise TimeoutError("Installing node requirements timed out")
+                raise TimeoutError("Installation command timed out")
             time.sleep(0.2)
         reader.join(timeout=5)
         return process.returncode, task.result["output"]
@@ -146,7 +155,11 @@ def run_pip(arguments, task, label, cwd):
         process.stdout.close()
 
 
-def install(identifier, name, requirements=True):
+def run_pip(arguments, task, label, cwd):
+    return _run_command([sys.executable, "-m", "pip", "--disable-pip-version-check", *arguments], task, label, cwd)
+
+
+def install(identifier, name, requirements=True, *, task=None):
     folder = stage(identifier)
     summary = read_json(folder / "package.json", None)
     if not summary:
@@ -183,7 +196,7 @@ def install(identifier, name, requirements=True):
                 installed = True
             finally:
                 if temporary.is_dir():
-                    shutil.rmtree(temporary)
+                    shutil.rmtree(temporary, onerror=remove_readonly)
                 else:
                     temporary.unlink(missing_ok=True)
             if requirements and summary["requirements"] is not None:
@@ -201,18 +214,106 @@ def install(identifier, name, requirements=True):
                 history = read_json(HISTORY, [])
                 history.append({"id": identifier, "name": name, "created": time.time(), **result})
                 write_json(HISTORY, history, private=True)
-            shutil.rmtree(folder, ignore_errors=True)
+            shutil.rmtree(folder, onerror=remove_readonly)
             return result
         except Exception:
             if installed:
                 if target.is_dir():
-                    shutil.rmtree(target)
+                    shutil.rmtree(target, onerror=remove_readonly)
                 else:
                     target.unlink(missing_ok=True)
             raise
         finally:
             TASKS.release(target)
-    return TASKS.add("install-node", "Install custom node: " + name, run)
+    return run(task) if task is not None else TASKS.add("install-node", "Install custom node: " + name, run)
+
+
+MANAGER_REPOSITORY = "https://github.com/Comfy-Org/ComfyUI-Manager"
+
+
+def github_repository(value):
+    safe_url(value, {"github.com"})
+    parsed = urlsplit(value)
+    parts = parsed.path.strip("/").removesuffix(".git").split("/")
+    if parsed.query or parsed.fragment or len(parts) != 2 or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part) or part in (".", "..") for part in parts):
+        raise ValueError("Paste a GitHub repository URL, without a file path or query")
+    return "https://github.com/" + "/".join(parts)
+
+
+def manager_present():
+    base = resolve("custom_nodes")
+    for path in base.iterdir():
+        if path.name.lower().replace("_", "-") == "comfyui-manager":
+            return True
+    return "comfyui_manager" in sys.modules or "comfyui-manager" in sys.modules
+
+
+def install_github(repository, name=None, revision=None, requirements=True, *, task=None):
+    repository = github_repository(repository)
+    name = name or repository.rsplit("/", 1)[1]
+    target = child("custom_nodes", "", name)
+    if name.startswith(".") or name.endswith(".py"):
+        raise ValueError("Choose a custom node folder name")
+    if target.exists():
+        raise FileExistsError("Custom node already exists: " + name)
+    if revision and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision)):
+        raise ValueError("Expected a saved 40-character Git commit")
+
+    def run(current):
+        identifier = uuid.uuid4().hex
+        folder = STAGING / identifier
+        uploaded = folder / "uploaded"
+        uploaded.mkdir(parents=True)
+        try:
+            current.result = {"stage": "Downloading " + name}
+            git = shutil.which("git")
+            match = None
+            commit = revision
+            if git:
+                checkout = uploaded / "repository"
+                hooks = folder / "empty-hooks"
+                hooks.mkdir()
+                env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                       "GIT_ALLOW_PROTOCOL": "https", "GIT_LFS_SKIP_SMUDGE": "1"}
+                prefix = [git, "-c", "core.hooksPath=" + str(hooks), "-c", "credential.helper="]
+                code, output = _run_command([*prefix, "clone", "--depth", "1", "--no-checkout", repository, str(checkout)], current, "Cloning " + name, uploaded, env)
+                if code:
+                    raise OSError("GitHub clone failed: " + output[-300:])
+                if revision:
+                    code, output = _run_command([*prefix, "-C", str(checkout), "fetch", "--depth", "1", "origin", revision], current, "Fetching saved revision", uploaded, env)
+                    if code:
+                        raise OSError("Saved GitHub revision is unavailable: " + output[-300:])
+                checkout_args = ["checkout", "--detach", revision] if revision else ["checkout", "--force"]
+                code, output = _run_command([*prefix, "-C", str(checkout), *checkout_args], current, "Checking out plugin", uploaded, env)
+                if code:
+                    raise OSError("GitHub checkout failed: " + output[-300:])
+                reject_symlinks(checkout)
+                head = (checkout / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+                if head.startswith("ref: "):
+                    reference = checkout / ".git" / relative_path(head[5:])
+                    head = reference.read_text(encoding="utf-8").strip() if reference.is_file() else ""
+                commit = head if re.fullmatch(r"[0-9a-f]{40}", head) else revision
+            else:
+                url = "https://api.github.com/repos/" + repository.split("github.com/", 1)[1] + "/zipball/" + (revision or "HEAD")
+                archive_path = uploaded / "repository.zip"
+                asyncio.run(_download(current, url, archive_path))
+                with zipfile.ZipFile(archive_path) as archive:
+                    first = archive.namelist()[0].split("/", 1)[0]
+                match = re.search(r"-([0-9a-f]{7,40})$", first)
+            prepare(identifier)
+            summary = read_json(folder / "package.json", {})
+            if (folder / summary["content"] / ".gitmodules").exists():
+                raise ValueError("This repository uses Git submodules; install it with Git and its documented setup")
+            result = install(identifier, name, requirements, task=current)
+            if not git:
+                write_json(target / ".robot-source.json", {"repository": repository, "commit": commit,
+                           "archive_revision": match.group(1) if match else None}, private=True)
+            return {**result, "repository": repository, "commit": commit, "git_checkout": bool(git),
+                    "note": "Git was unavailable; archive installed. Install Git for Manager's Git-based update features." if not git else ""}
+        finally:
+            if folder.exists():
+                shutil.rmtree(folder, onerror=remove_readonly)
+    return run(task) if task is not None else TASKS.add("install-node", "Install GitHub node: " + name, run)
 
 
 def history():

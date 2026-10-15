@@ -5,7 +5,7 @@ import json
 import os
 import re
 from pathlib import PurePosixPath
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
 import aiohttp
 
@@ -15,6 +15,7 @@ from .tasks import PublicResolver
 
 
 CREDENTIALS = DATA / "credentials.json"
+AUTH_PROFILES = DATA / "authorization.json"
 
 
 def _windows_crypt(value, protect):
@@ -47,7 +48,7 @@ def credential(platform):
 
 
 def set_credential(platform, token):
-    if platform not in ("huggingface", "civitai") or not isinstance(token, str) or len(token) > 2048:
+    if (platform not in ("huggingface", "civitai") and not re.fullmatch(r"custom:[A-Za-z0-9_-]{1,40}", platform)) or not isinstance(token, str) or len(token) > 8192:
         raise ValueError("Invalid credential")
     saved = read_json(CREDENTIALS, {})
     if token.strip():
@@ -62,6 +63,83 @@ def set_credential(platform, token):
     else:
         saved.pop(platform, None)
     write_json(CREDENTIALS, saved, private=True)
+
+
+def auth_profiles():
+    return read_json(AUTH_PROFILES, {})
+
+
+def set_auth_profile(name, host, method, secret, username="", header="Authorization"):
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+        raise ValueError("Profile name must contain letters, numbers, underscores or hyphens")
+    profiles = auth_profiles()
+    if method == "delete":
+        profiles.pop(name, None)
+        set_credential("custom:" + name, "")
+    else:
+        safe_url("https://" + host + "/")
+        if urlsplit("https://" + host).netloc != host or "/" in host or host.endswith("."):
+            raise ValueError("Enter an exact HTTPS host, such as downloads.example.com")
+        if method not in ("bearer", "basic", "header") or not isinstance(secret, str) or not secret or len(secret) > 4096 or any(c in secret for c in "\r\n\x00"):
+            raise ValueError("Choose an authorization method and enter its secret")
+        if not isinstance(username, str) or ":" in username or any(c in username for c in "\r\n\x00"):
+            raise ValueError("Invalid Basic authentication username")
+        if not isinstance(header, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,79}", header) or header.lower() in ("host", "range", "content-length", "connection", "transfer-encoding", "cookie", "accept-encoding"):
+            raise ValueError("Choose an authorization header, such as X-API-Key")
+        set_credential("custom:" + name, json.dumps({"secret": secret, "username": username}))
+        profiles[name] = {"name": name, "host": host.lower(), "method": method, "header": header}
+    write_json(AUTH_PROFILES, profiles, private=True)
+
+
+def authorization_headers(url, name):
+    if not name:
+        return {}
+    profile = auth_profiles().get(name)
+    if not profile or urlsplit(url).netloc.lower() != profile["host"] or urlsplit(url).scheme != "https":
+        raise ValueError("Authorization profile does not match this download host")
+    saved = credential("custom:" + name)
+    if not saved:
+        raise ValueError("Authorization profile has no saved secret")
+    value = json.loads(saved)
+    if profile["method"] == "basic":
+        encoded = base64.b64encode((value["username"] + ":" + value["secret"]).encode()).decode("ascii")
+        return {"Authorization": "Basic " + encoded}
+    if profile["method"] == "bearer":
+        return {"Authorization": "Bearer " + value["secret"]}
+    return {profile["header"]: value["secret"]}
+
+
+async def test_access(platform):
+    if platform == "huggingface":
+        if not credential(platform):
+            raise ValueError("Save a Hugging Face token first")
+        result = await request_json("https://huggingface.co/api/whoami-v2", platform)
+        return {"message": "Authenticated as " + str(result.get("name", "Hugging Face user"))}
+    if platform == "civitai":
+        await request_json("https://civitai.com/api/v1/models?limit=1", platform)
+        return {"message": "Civitai API is reachable. Access to restricted files is checked when downloading."}
+    raise ValueError("Unknown provider")
+
+
+async def browse_models(platform, query="", page=1):
+    if not isinstance(query, str) or len(query) > 200 or not isinstance(page, int) or not 1 <= page <= 5:
+        raise ValueError("Use a search of up to 200 characters and pages 1 to 5")
+    if platform == "civitai":
+        data = await request_json("https://civitai.com/api/v1/models?" + urlencode({"limit": 20, "page": page, "query": query, "nsfw": "false"}), platform)
+        items = []
+        for model in data.get("items", []):
+            versions = model.get("modelVersions", [])
+            images = versions[0].get("images", []) if versions else []
+            image = images[0].get("url") if images else None
+            items.append({"name": str(model.get("name", "Model")), "type": str(model.get("type", "")),
+                          "url": "https://civitai.com/models/" + str(int(model["id"])), "image": image})
+        return {"items": items, "more": bool(data.get("metadata", {}).get("nextPage")) and page < 5}
+    if platform == "huggingface":
+        data = await request_json("https://huggingface.co/api/models?" + urlencode({"search": query, "limit": page * 20, "sort": "downloads", "direction": -1}), platform)
+        return {"items": [{"name": item["id"], "type": item.get("pipeline_tag", "Model"),
+                           "url": "https://huggingface.co/" + quote(item["id"], safe="/"), "image": None}
+                          for item in data[(page - 1) * 20:page * 20]], "more": len(data) == page * 20 and page < 5}
+    raise ValueError("Choose Civitai or Hugging Face")
 
 
 async def request_json(url, platform=None):

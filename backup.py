@@ -1,4 +1,6 @@
 import json
+import importlib.metadata
+import platform
 import os
 import re
 import shutil
@@ -20,10 +22,12 @@ from .tasks import TASKS
 
 
 FORMAT = "robot-file-manager-backup"
-SCHEMA = 2
-VERSION = "1.1.0"
+SCHEMA = 3
+VERSION = "1.2.0"
 COMFY_SETTINGS_ALLOWLIST = {"Comfy.Minimap.Visible", "Comfy.Queue.History.Expanded", "Comfy.RightSidePanel.IsOpen",
                             "Comfy.Templates.SelectedRunsOn", "Comfy.Templates.SortBy", "Comfy.TutorialCompleted"}
+COMFY_SETTINGS_PREFIXES = ("Comfy.Graph.", "Comfy.Workflow.", "Comfy.Canvas.", "Comfy.Node.", "Comfy.Link.",
+                           "Comfy.Keybinding.", "Comfy.Sidebar.", "Comfy.Menu.", "Comfy.ColorPalette", "Comfy.Locale", "Comfy.TextareaWidget.")
 EXPORTS = DATA / "exports"
 IMPORTS = DATA / "imports"
 EXPORTS.mkdir(exist_ok=True)
@@ -31,14 +35,17 @@ IMPORTS.mkdir(exist_ok=True)
 
 
 def bundled_custom_node_files(names):
-    if not isinstance(names, list) or len(names) > 100 or any(not isinstance(name, str) for name in names) or len(names) != len({name.casefold() for name in names}):
-        raise ValueError("Select up to 100 distinct custom node folders")
+    if not isinstance(names, list) or len(names) > 1000 or any(not isinstance(name, str) for name in names) or len(names) != len({name.casefold() for name in names}):
+        raise ValueError("Select up to 1000 distinct custom node folders")
     base = Path(folder_paths.base_path).resolve() / "custom_nodes"
     files = []
     for name in names:
         if not isinstance(name, str) or len(name) > 200 or name.startswith(".") or len(relative_path(name).parts) != 1:
             raise ValueError("Invalid custom node folder")
         folder = resolve("custom_nodes", name, must_exist=True)
+        if folder.is_file() and folder.suffix == ".py" and name != "__init__.py":
+            files.append(("custom_nodes/" + name + "/" + name, folder))
+            continue
         if not folder.is_dir():
             raise ValueError("Select a custom node folder")
         for parent, dirs, filenames in os.walk(folder, followlinks=False):
@@ -54,6 +61,28 @@ def bundled_custom_node_files(names):
                 if len(files) > 100000:
                     raise ValueError("Too many custom node files")
     return names, files
+
+
+def setup_options(options):
+    options = dict(options)
+    if options.get("preset") == "setup":
+        custom = custom_node_manifest({})
+        options.update(workflows=True, models=True, sources=True, custom_nodes=True, comfy_settings=True,
+                       plugin_settings=True, bundled_custom_nodes=[item["package"] for item in custom
+                       if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?", item.get("repository") or "") or
+                       not item.get("commit") or item.get("modified")])
+    return options
+
+
+def environment_manifest():
+    version_file = Path(folder_paths.base_path) / "comfyui_version.py"
+    version = re.search(r'__version__\s*=\s*[\'"]([^\'"]+)', version_file.read_text(encoding="utf-8")) if version_file.is_file() else None
+    return {"comfyui_version": version.group(1) if version else None,
+            "python": platform.python_version(), "platform": platform.system(), "machine": platform.machine(),
+            "packages": sorted({(dist.metadata.get("Name", "unknown"), dist.version) for dist in importlib.metadata.distributions()}),
+            "model_paths": [{"root": name, "path": str(path), "external": not inside(path, Path(folder_paths.base_path).resolve())}
+                            for name, path in roots().items() if name == "models" or name.startswith("model:")],
+            "note": "Source-machine paths and package versions are informational. Select target model folders during import; hardware-specific packages may need manual installation."}
 
 
 def requirement_specs(raw):
@@ -216,6 +245,7 @@ def backup_data(options):
 
 
 def preview(options):
+    options = setup_options(options)
     workflows, models, custom, outputs = backup_data(options)
     output_size = sum(path.stat().st_size for _, path in outputs)
     packages, node_files = bundled_custom_node_files(options.get("bundled_custom_nodes", []))
@@ -263,14 +293,17 @@ def write_zip_file(archive, path, archive_name, task, completed, total, compress
 
 def create_backup(options):
     def run(task):
-        workflows, models, custom, outputs = backup_data(options)
-        packages, node_files = bundled_custom_node_files(options.get("bundled_custom_nodes", []))
-        if packages and not options.get("custom_nodes", True):
+        selected = setup_options(options)
+        workflows, models, custom, outputs = backup_data(selected)
+        packages, node_files = bundled_custom_node_files(selected.get("bundled_custom_nodes", []))
+        if packages and not selected.get("custom_nodes", True):
             raise ValueError("Include the custom node manifest when bundling folders")
         for item in custom:
             item["bundled"] = item["package"] in packages
         output_size = sum(path.stat().st_size for _, path in outputs)
         node_size = sum(path.stat().st_size for _, path in node_files)
+        if len(workflows) + len(outputs) + len(node_files) + 5 > 100000:
+            raise ValueError("Backup has too many files; export outputs in smaller batches")
         if shutil.disk_usage(EXPORTS).free < output_size + node_size + 100 * 1024 * 1024:
             raise OSError("Not enough free space for the backup ZIP")
         identifier = uuid.uuid4().hex
@@ -279,20 +312,28 @@ def create_backup(options):
         manifest = {"backup_format": FORMAT, "schema_version": SCHEMA, "plugin_version": VERSION,
                     "created_at": datetime.now(timezone.utc).isoformat(), "contains_outputs": bool(outputs),
                     "workflow_destinations": destinations, "bundled_custom_nodes": packages}
-        plugin_settings = settings() if options.get("plugin_settings", True) else None
+        plugin_settings = {key: value for key, value in settings().items() if key != "manager_setup_attempted"} if selected.get("plugin_settings", True) else None
         comfy_settings = None
-        if options.get("comfy_settings"):
+        comfy_users = {}
+        if selected.get("comfy_settings"):
             path = Path(folder_paths.get_user_directory()) / "default" / "comfy.settings.json"
             if path.is_file() and path.stat().st_size < 2 * 1024 * 1024:
                 comfy_settings = safe_comfy_settings(read_json(path, {}))
+            user_root = Path(folder_paths.get_user_directory())
+            for profile in user_root.iterdir():
+                if profile.name.startswith(".") or profile.is_symlink() or not profile.is_dir():
+                    continue
+                path = resolve("user", profile.name + "/comfy.settings.json")
+                if path.is_file() and path.stat().st_size < 2 * 1024 * 1024:
+                    comfy_users[profile.name] = safe_comfy_settings(read_json(path, {}))
         count = 0
         total = output_size + node_size + sum(entry["size"] for entry in workflows)
         task.total = total
         try:
-            with zipfile.ZipFile(archive, "w", allowZip64=True) as output:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as output:
                 for name, value in (("manifest.json", manifest), ("models_manifest.json", models),
-                                    ("custom_nodes_manifest.json", custom),
-                                    ("settings.json", {"plugin": plugin_settings, "comfy": comfy_settings})):
+                                    ("custom_nodes_manifest.json", custom), ("environment.json", environment_manifest()),
+                                    ("settings.json", {"plugin": plugin_settings, "comfy": comfy_settings, "comfy_users": comfy_users})):
                     output.writestr(name, json.dumps(value, ensure_ascii=False, indent=2))
                 for entry, destination in zip(workflows, destinations):
                     task.check()
@@ -371,9 +412,9 @@ def _safe_entries(archive):
         mode = (item.external_attr >> 16) & 0o170000
         if mode == stat.S_IFLNK:
             raise ValueError("Archive contains a symbolic link")
-        if parts[0] not in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json", "workflows", "outputs", "custom_nodes"):
+        if parts[0] not in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json", "environment.json", "workflows", "outputs", "custom_nodes"):
             raise ValueError("Archive contains an unexpected file")
-        if parts[0] in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json") and len(parts) != 1:
+        if parts[0] in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json", "environment.json") and len(parts) != 1:
             raise ValueError("Invalid metadata path")
         if parts[0] == "workflows" and not item.is_dir() and (len(parts) < 2 or not name.lower().endswith(".json")):
             raise ValueError("Workflow archive entry must be JSON")
@@ -381,7 +422,7 @@ def _safe_entries(archive):
             raise ValueError("Model binaries are not allowed in a workspace backup")
         if parts[0] == "custom_nodes" and (len(parts) < 3 or Path(name).suffix.lower() in MODEL_EXTENSIONS):
             raise ValueError("Invalid custom node archive entry")
-        if parts[0] in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json") and item.file_size > 10 * 1024 * 1024:
+        if parts[0] in ("manifest.json", "models_manifest.json", "custom_nodes_manifest.json", "settings.json", "environment.json") and item.file_size > 10 * 1024 * 1024:
             raise ValueError("Backup metadata is too large")
         if item.file_size > max(item.compress_size, 1) * 1000 and item.file_size > 100 * 1024 * 1024:
             raise ValueError("Archive entry expands unexpectedly")
@@ -397,10 +438,10 @@ def validate_archive(path):
         if archive.getinfo("manifest.json").file_size > 1024 * 1024:
             raise ValueError("Backup manifest is too large")
         manifest = json.loads(archive.read("manifest.json"))
-        if manifest.get("backup_format") != FORMAT or manifest.get("schema_version") not in (1, SCHEMA):
+        if manifest.get("backup_format") != FORMAT or manifest.get("schema_version") not in (1, 2, SCHEMA):
             raise ValueError("Unsupported backup format or schema")
         packages = manifest.get("bundled_custom_nodes", [])
-        if (not isinstance(packages, list) or len(packages) > 100 or any(not isinstance(name, str) or
+        if (not isinstance(packages, list) or len(packages) > 1000 or any(not isinstance(name, str) or
                 name.startswith(".") or len(name) > 200 or len(relative_path(name).parts) != 1 for name in packages) or
                 len(packages) != len({name.casefold() for name in packages})):
             raise ValueError("Invalid bundled custom nodes")
@@ -452,11 +493,15 @@ def validate_archive(path):
         for package in custom:
             if not isinstance(package, dict) or not isinstance(package.get("package"), str) or len(package["package"]) > 200:
                 raise ValueError("Invalid custom node entry")
+            if package["package"].startswith(".") or len(relative_path(package["package"]).parts) != 1 or package["package"] == "__init__.py":
+                raise ValueError("Invalid custom node folder")
             if not isinstance(package.get("nodes", []), list) or len(package.get("nodes", [])) > 1000 or any(
                     not isinstance(name, str) or len(name) > 200 for name in package.get("nodes", [])):
                 raise ValueError("Invalid custom node names")
             if package.get("repository"):
                 public_source_url(package["repository"])
+            if package.get("commit") is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", str(package["commit"])):
+                raise ValueError("Invalid custom node revision")
         if set(packages) - {package["package"] for package in custom}:
             raise ValueError("Bundled custom node is missing from the manifest")
         installed = scan_models()
@@ -488,7 +533,7 @@ def validate_archive(path):
                 missing = [name for name in package.get("nodes", []) if name not in nodes.NODE_CLASS_MAPPINGS]
                 name = package["package"]
                 try:
-                    present = len(relative_path(name).parts) == 1 and (custom_root / name).is_dir() and not (custom_root / name).is_symlink()
+                    present = len(relative_path(name).parts) == 1 and (custom_root / name).exists() and not (custom_root / name).is_symlink()
                 except ValueError:
                     present = False
                 status = "Installed" if present and not missing else "Files present" if present else "Missing"
@@ -496,14 +541,36 @@ def validate_archive(path):
                                     "bundled": name in packages, "files_present": present,
                                     "requirements_present": present and (custom_root / name / "requirements.txt").is_file() and
                                     not (custom_root / name / "requirements.txt").is_symlink()})
-        return {"manifest": manifest, "models": model_status, "custom_nodes": node_status,
+        destinations = {item["archive"]: item for item in workflow_destinations}
+        files = []
+        for item in archive.infolist():
+            if item.is_dir() or not item.filename.startswith(("workflows/", "outputs/")):
+                continue
+            destination = destinations.get(item.filename)
+            root = destination["root"] if destination else "output" if item.filename.startswith("outputs/") else "user"
+            relative = destination["path"] if destination else item.filename.split("/", 1)[1] if root == "output" else "default/workflows/" + item.filename.split("/", 1)[1]
+            files.append({"archive": item.filename, "root": root, "path": relative, "size": item.file_size,
+                          "exists": resolve(root, relative).exists()})
+        environment = json.loads(archive.read("environment.json")) if "environment.json" in archive.namelist() else {}
+        if not isinstance(environment, dict):
+            raise ValueError("Invalid environment manifest")
+        model_paths = environment.get("model_paths", [])
+        if not isinstance(model_paths, list) or any(not isinstance(item, dict) or not isinstance(item.get("root"), str) or not isinstance(item.get("path"), str) for item in model_paths):
+            raise ValueError("Invalid model-folder configuration")
+        preferences = json.loads(archive.read("settings.json")) if "settings.json" in archive.namelist() else {}
+        if not isinstance(preferences, dict) or not isinstance(preferences.get("comfy_users", {}), dict):
+            raise ValueError("Invalid backup settings")
+        for profile in preferences.get("comfy_users", {}):
+            if profile.startswith(".") or len(relative_path(profile).parts) != 1:
+                raise ValueError("Invalid settings profile")
+        return {"manifest": manifest, "models": model_status, "custom_nodes": node_status, "files": files, "environment": environment,
                 "workflows": len([name for name in archive.namelist() if name.startswith("workflows/") and not name.endswith("/")]),
                 "outputs": len([name for name in archive.namelist() if name.startswith("outputs/") and not name.endswith("/")]),
                 "uncompressed_size": total, "free_space": shutil.disk_usage(Path(folder_paths.get_user_directory())).free}
 
 
 def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False, comfy_settings=False, plugin_settings=False,
-                   custom_nodes=None, install_requirements=False):
+                   custom_nodes=None, install_requirements=False, selected_files=None, task=None):
     path = import_archive(import_id)
     summary = validate_archive(path)
     selected_nodes = [] if custom_nodes is None else custom_nodes
@@ -512,16 +579,21 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
             len(selected_nodes) != len({name.casefold() for name in selected_nodes}) or not set(selected_nodes) <= bundled):
         raise ValueError("Select custom nodes bundled in this backup")
     missing_nodes = [name for name in selected_nodes if not resolve("custom_nodes", name).exists()]
+    if selected_files is not None and (not isinstance(selected_files, list) or any(not isinstance(name, str) for name in selected_files) or
+            not set(selected_files) <= {item["archive"] for item in summary["files"]}):
+        raise ValueError("Select files listed in the import preview")
+    file_selection = set(selected_files) if selected_files is not None else None
     with zipfile.ZipFile(path) as archive:
-        workflow_size = sum(item.file_size for item in archive.infolist() if workflows and item.filename.startswith("workflows/"))
-        output_size = sum(item.file_size for item in archive.infolist() if outputs and item.filename.startswith("outputs/"))
         node_size = sum(item.file_size for item in archive.infolist() if item.filename.startswith("custom_nodes/") and
                         PurePosixPath(item.filename).parts[1] in missing_nodes)
-    user_folder = Path(folder_paths.get_user_directory())
-    output_folder = Path(folder_paths.get_output_directory())
     custom_folder = Path(folder_paths.base_path) / "custom_nodes"
     required = {}
-    for folder, size in ((user_folder, workflow_size), (output_folder, output_size), (custom_folder, node_size)):
+    sizes = [(custom_folder, node_size)]
+    for item in summary["files"]:
+        if ((item["archive"].startswith("workflows/") and workflows or item["archive"].startswith("outputs/") and outputs) and
+                (file_selection is None or item["archive"] in file_selection) and (overwrite or not item["exists"])):
+            sizes.append((roots()[item["root"]], item["size"]))
+    for folder, size in sizes:
         device = folder.stat().st_dev
         used, free = required.get(device, (0, shutil.disk_usage(folder).free))
         required[device] = (used + size, free)
@@ -537,7 +609,7 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
             destinations = {item["archive"]: item for item in manifest.get("workflow_destinations", [])}
             entries = [item for item in archive.infolist() if not item.is_dir() and
                        ((workflows and item.filename.startswith("workflows/")) or
-                        (outputs and item.filename.startswith("outputs/")))]
+                        (outputs and item.filename.startswith("outputs/"))) and (file_selection is None or item.filename in file_selection)]
             node_entries = {name: [item for item in archive.infolist() if not item.is_dir() and
                                    item.filename.startswith("custom_nodes/" + name + "/")]
                             for name in selected_nodes}
@@ -582,6 +654,8 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
                 temporary = custom_folder / (".robot-restore-" + uuid.uuid4().hex)
                 temporary.mkdir()
                 try:
+                    if name.endswith(".py") and (len(files) != 1 or files[0].filename != "custom_nodes/" + name + "/" + name):
+                        raise ValueError("Invalid single-file custom node bundle")
                     for item in files:
                         task.check()
                         relative = item.filename.split("/", 2)[2]
@@ -595,7 +669,10 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
                         task.progress(completed, total_entries)
                     if target.exists():
                         raise FileExistsError(name)
-                    temporary.rename(target)
+                    if name.endswith(".py"):
+                        (temporary / name).rename(target)
+                    else:
+                        temporary.rename(target)
                     restored += 1
                 finally:
                     if temporary.exists():
@@ -605,16 +682,23 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
                 if not isinstance(data, dict):
                     raise ValueError("Invalid backup settings")
                 if comfy_settings:
-                    safe = safe_comfy_settings(data.get("comfy"))
-                    target = resolve("user", "default/comfy.settings.json")
-                    if safe:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        current = read_json(target, {})
-                        if not isinstance(current, dict):
-                            raise ValueError("Existing ComfyUI settings are invalid")
-                        current.update(safe)
-                        write_json(target, current)
-                        restored += 1
+                    users = data.get("comfy_users", {})
+                    if not isinstance(users, dict):
+                        raise ValueError("Invalid user settings")
+                    users = {"default": data.get("comfy"), **users}
+                    for profile, value in users.items():
+                        if not isinstance(profile, str) or profile.startswith(".") or len(relative_path(profile).parts) != 1:
+                            raise ValueError("Invalid settings profile")
+                        safe = safe_comfy_settings(value)
+                        target = resolve("user", profile + "/comfy.settings.json")
+                        if safe:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            current = read_json(target, {})
+                            if not isinstance(current, dict):
+                                raise ValueError("Existing ComfyUI settings are invalid")
+                            current.update(safe)
+                            write_json(target, current)
+                            restored += 1
                 if plugin_settings and isinstance(data.get("plugin"), dict):
                     plugin = data["plugin"]
                     current = settings()
@@ -623,12 +707,14 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
                     ttl = plugin.get("export_ttl_hours")
                     if type(ttl) is int and 1 <= ttl <= 168:
                         current["export_ttl_hours"] = ttl
+                    if isinstance(plugin.get("auto_install_manager"), bool):
+                        current["auto_install_manager"] = plugin["auto_install_manager"]
                     write_json(SETTINGS, current, private=True)
                     restored += 1
         return {"restored": restored, "skipped": skipped, "requirements_installed": installed_requirements,
                 "missing_models": sum(item["status"] == "Missing" for item in summary["models"]),
                 "missing_custom_nodes": sum(item["status"] == "Missing" for item in summary["custom_nodes"])}
-    return TASKS.add("restore", "Restore workspace", run)
+    return run(task) if task is not None else TASKS.add("restore", "Restore workspace", run)
 
 
 def import_archive(identifier):
@@ -643,11 +729,13 @@ def import_archive(identifier):
 def safe_comfy_settings(value):
     if not isinstance(value, dict):
         return {}
-    return {key: item for key, item in value.items() if key in COMFY_SETTINGS_ALLOWLIST and
-            isinstance(item, (str, int, float, bool)) and len(str(item)) <= 200}
+    return {key: item for key, item in value.items() if (key in COMFY_SETTINGS_ALLOWLIST or key.startswith(COMFY_SETTINGS_PREFIXES)) and
+            isinstance(item, (str, int, float, bool, list, dict)) and len(json.dumps(item)) <= 65536}
 
 
 def cleanup_exports():
+    if any(item["status"] in ("waiting", "running", "pausing", "cancelling") and item["kind"] in ("backup", "restore", "migration", "zip") for item in TASKS.snapshot()):
+        return
     cutoff = time.time() - settings()["export_ttl_hours"] * 3600
     for folder in (EXPORTS, IMPORTS):
         for path in folder.glob("*.zip"):

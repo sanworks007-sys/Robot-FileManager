@@ -52,6 +52,8 @@ class CoreTests(unittest.TestCase):
         cls.transfers = importlib.import_module("rfm.transfers")
         cls.terminal = importlib.import_module("rfm.terminal")
         cls.installer = importlib.import_module("rfm.installer")
+        cls.storage = importlib.import_module("rfm.storage")
+        cls.migration = importlib.import_module("rfm.migration")
         server = types.ModuleType("server")
         server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=web.RouteTableDef(),
             prompt_queue=types.SimpleNamespace(get_tasks_remaining=lambda: 0)))
@@ -168,7 +170,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("custom_nodes/bundled-node/requirements.txt", names)
             self.assertNotIn("custom_nodes/bundled-node/.env", names)
             self.assertNotIn("custom_nodes/bundled-node/large-model.safetensors", names)
-            self.assertEqual(json.loads(archive.read("manifest.json"))["schema_version"], 2)
+            self.assertEqual(json.loads(archive.read("manifest.json"))["schema_version"], self.backup.SCHEMA)
         imported = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
         shutil.copyfile(exported, imported)
         shutil.rmtree(folder)
@@ -284,7 +286,7 @@ class CoreTests(unittest.TestCase):
         self.wait_task(self.backup.restore_backup(path.stem, workflows=False, comfy_settings=True, plugin_settings=True))
         restored = json.loads(comfy.read_text(encoding="utf-8"))
         self.assertEqual(restored, {"Other.Setting": "keep", "Comfy.Minimap.Visible": True})
-        self.assertEqual(self.security.settings(), {"trash": False, "export_ttl_hours": 12})
+        self.assertEqual(self.security.settings(), {"trash": False, "export_ttl_hours": 12, "auto_install_manager": True, "manager_setup_attempted": False})
         self.security.write_json(self.security.SETTINGS, {"trash": True, "export_ttl_hours": 24}, private=True)
 
     def test_workflow_restore_ignores_unselected_output_size(self):
@@ -705,6 +707,300 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
 
         asyncio.run(exercise())
+
+    def test_migration_selects_files_and_restores_local_and_github_nodes(self):
+        identifier = uuid.uuid4().hex
+        path = self.backup.IMPORTS / (identifier + ".zip")
+        local = "migration-local"
+        remote = "migration-github"
+        destination = {"archive": "workflows/user/default/migration.json", "root": "user", "path": "default/workflows/migration.json"}
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", json.dumps({"backup_format": self.backup.FORMAT, "schema_version": 3,
+                "bundled_custom_nodes": [local], "workflow_destinations": [destination]}))
+            archive.writestr(destination["archive"], '{"nodes": []}')
+            archive.writestr("outputs/migration-skipped.png", b"skip")
+            archive.writestr("custom_nodes/" + local + "/__init__.py", "NODE_CLASS_MAPPINGS = {}")
+            archive.writestr("custom_nodes_manifest.json", json.dumps([{"package": local}, {"package": remote,
+                "repository": "https://github.com/example/migration-github", "commit": "a" * 40}]))
+        def github(repository, name, revision, requirements, task=None):
+            self.assertEqual(revision, "a" * 40)
+            folder = self.base / "custom_nodes" / name
+            folder.mkdir()
+            (folder / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}")
+            return {"installed": True}
+        with patch.object(self.installer, "install_github", side_effect=github) as install:
+            result = self.wait_task(self.migration.restore(identifier, {"selected_files": [destination["archive"]],
+                "custom_nodes": [local, remote], "install_requirements": False, "install_manager": False}))
+        self.assertTrue((self.base / "user/default/workflows/migration.json").is_file())
+        self.assertFalse((self.base / "output/migration-skipped.png").exists())
+        self.assertTrue((self.base / "custom_nodes" / local / "__init__.py").is_file())
+        self.assertEqual(len(result["report"]["errors"]), 0)
+        install.assert_called_once()
+
+    def test_migration_downloads_exact_model_and_reports_unknown_sources(self):
+        path = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", json.dumps({"backup_format": self.backup.FORMAT, "schema_version": 3}))
+            archive.writestr("models_manifest.json", json.dumps([
+                {"name": "migration-download.safetensors", "sources": {"direct": "https://example.com/migration-download.safetensors"}},
+                {"name": "unknown-download.safetensors"}]))
+        async def source(value):
+            return {"files": [{"name": "migration-download.safetensors", "url": value}]}
+        async def download(task, url, target, token=None):
+            target.write_bytes(b"model")
+        with patch.object(self.providers, "source_info", side_effect=source), patch.object(self.tasks, "_download", side_effect=download):
+            task = self.migration.restore(path.stem, {"selected_files": [], "install_manager": False,
+                "models": [{"index": 0, "root": "models", "folder": "migration"}, {"index": 1}]})
+            deadline = time.time() + 5
+            while task.status in ("waiting", "running") and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(task.status, "failed")
+            self.assertTrue(task.public()["retryable"])
+            result = task.result
+        self.assertEqual((self.base / "models/migration/migration-download.safetensors").read_bytes(), b"model")
+        self.assertEqual(result["report"]["errors"][0]["name"], "unknown-download.safetensors")
+        self.assertIn("source", result["report"]["errors"][0]["error"])
+
+    def test_migration_rejects_unknown_selections_before_starting(self):
+        path = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", json.dumps({"backup_format": self.backup.FORMAT, "schema_version": 2}))
+        for options in ({"custom_nodes": ["../bad"]}, {"models": [{"index": 4}]}, {"selected_files": ["outputs/missing.txt"]}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.migration.restore(path.stem, options)
+
+    def test_setup_preset_bundles_unpublished_modified_and_single_file_nodes(self):
+        for name in ("preset-local", "preset-clean", "preset-dirty"):
+            folder = self.base / "custom_nodes" / name
+            folder.mkdir(exist_ok=True)
+            (folder / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}")
+        single = self.base / "custom_nodes/preset_single.py"
+        single.write_text("NODE_CLASS_MAPPINGS = {}")
+        records = [{"package": "preset-local", "repository": None},
+            {"package": "preset-clean", "repository": "https://github.com/example/clean", "commit": "a" * 40, "modified": False},
+            {"package": "preset-dirty", "repository": "https://github.com/example/dirty", "modified": True},
+            {"package": single.name, "repository": None}]
+        with patch.object(self.backup, "custom_node_manifest", return_value=records):
+            options = self.backup.setup_options({"preset": "setup", "outputs": "skip"})
+            self.assertEqual(options["bundled_custom_nodes"], ["preset-local", "preset-dirty", single.name])
+            result = self.wait_task(self.backup.create_backup({"preset": "setup", "outputs": "skip"}))
+        exported = self.backup.EXPORTS / (result["export_id"] + ".zip")
+        with zipfile.ZipFile(exported) as archive:
+            self.assertIn("environment.json", archive.namelist())
+            self.assertNotIn("custom_nodes/preset-clean/__init__.py", archive.namelist())
+            self.assertEqual(archive.getinfo("manifest.json").compress_type, zipfile.ZIP_DEFLATED)
+        imported = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
+        shutil.copyfile(exported, imported)
+        single.unlink()
+        self.wait_task(self.backup.restore_backup(imported.stem, workflows=False, custom_nodes=[single.name]))
+        self.assertEqual(single.read_text(), "NODE_CLASS_MAPPINGS = {}")
+
+    def test_custom_authorization_is_host_scoped_and_excluded_from_export(self):
+        self.providers.set_auth_profile("private", "example.com", "header", "secret-custom-key", header="X-API-Key")
+        try:
+            self.assertEqual(self.providers.authorization_headers("https://example.com/model.bin", "private"), {"X-API-Key": "secret-custom-key"})
+            self.assertNotIn("secret-custom-key", json.dumps(self.providers.auth_profiles()))
+            with self.assertRaises(ValueError):
+                self.providers.authorization_headers("https://other.example.com/model.bin", "private")
+            result = self.wait_task(self.backup.create_backup({"workflows": False, "models": False, "outputs": "skip"}))
+            with zipfile.ZipFile(self.backup.EXPORTS / (result["export_id"] + ".zip")) as archive:
+                self.assertFalse(any(b"secret-custom-key" in archive.read(name) for name in archive.namelist()))
+        finally:
+            self.providers.set_auth_profile("private", "", "delete", "")
+
+    def test_custom_authorization_rejects_header_injection_and_reserved_headers(self):
+        for header, secret in (("Host", "value"), ("Range", "bytes=0-"), ("X-Key", "value\r\nHost: other")):
+            with self.subTest(header=header), self.assertRaises(ValueError):
+                self.providers.set_auth_profile("bad", "example.com", "header", secret, header=header)
+        self.providers.set_auth_profile("basic", "example.com", "basic", "password", username="user")
+        try:
+            self.assertEqual(self.providers.authorization_headers("https://example.com/x", "basic"), {"Authorization": "Basic dXNlcjpwYXNzd29yZA=="})
+        finally:
+            self.providers.set_auth_profile("basic", "", "delete", "")
+
+    def test_cleanup_preserves_active_partial_download_and_removes_inactive_partial(self):
+        active = self.base / "models/active-cleanup.bin"
+        inactive = self.base / "models/inactive-cleanup.bin.robot-part"
+        active.with_name(active.name + ".robot-part").write_bytes(b"active")
+        inactive.write_bytes(b"inactive")
+        inactive.with_name(inactive.name + ".json").write_text('{}')
+        task = self.tasks.TASKS.external("download", "paused")
+        task.target = active
+        task.status = "paused"
+        try:
+            candidates = self.storage.cleanup_candidates()
+            self.assertNotIn(active.with_name(active.name + ".robot-part"), [item["path"] for item in candidates])
+            result = self.wait_task(self.storage.clean(["partials"]))
+            self.assertTrue(active.with_name(active.name + ".robot-part").exists())
+            self.assertFalse(inactive.exists())
+            self.assertFalse(inactive.with_name(inactive.name + ".json").exists())
+            self.assertGreaterEqual(result["removed_bytes"], len(b"inactive"))
+        finally:
+            self.tasks.TASKS.control(task.id, "remove")
+            active.with_name(active.name + ".robot-part").unlink(missing_ok=True)
+
+    def test_delete_refuses_files_reserved_by_an_active_writer(self):
+        source = self.base / "output/reserved-delete.txt"
+        source.write_text("keep")
+        self.tasks.TASKS.reserve(source)
+        try:
+            task = self.tasks.file_operation("delete", [{"root": "output", "path": source.name}], permanent=True)
+            deadline = time.time() + 5
+            while task.status in ("waiting", "running") and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(task.status, "failed")
+            self.assertTrue(source.exists())
+        finally:
+            self.tasks.TASKS.release(source)
+
+    def test_github_installer_uses_archive_without_git_and_protects_existing_nodes(self):
+        async def download(task, url, target, token=None):
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("example-GitHubNode-abcdef0/__init__.py", "NODE_CLASS_MAPPINGS = {}")
+        find_tool = shutil.which
+        with patch.object(self.installer, "_download", side_effect=download), patch.object(self.installer.shutil, "which", side_effect=lambda name: None if name == "git" else find_tool(name)):
+            result = self.wait_task(self.installer.install_github("https://github.com/example/GitHubNode", requirements=False))
+        self.assertTrue(result["installed"])
+        marker = json.loads((self.base / "custom_nodes/GitHubNode/.robot-source.json").read_text())
+        self.assertEqual(marker["repository"], "https://github.com/example/GitHubNode")
+        with self.assertRaises(FileExistsError):
+            self.installer.install_github("https://github.com/example/GitHubNode")
+        for value in ("https://github.com/example/node/tree/main", "https://evil.example/a/b", "https://github.com/a/b?token=secret"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.installer.github_repository(value)
+
+    def test_browser_search_uses_provider_api_and_preserves_model_source(self):
+        async def response(url, platform):
+            self.assertIn("query=landscape", url)
+            return {"items": [{"id": 10, "name": "Landscape", "type": "LORA", "modelVersions": []}], "metadata": {"nextPage": "ignored"}}
+        with patch.object(self.providers, "request_json", side_effect=response):
+            result = asyncio.run(self.providers.browse_models("civitai", "landscape"))
+        self.assertEqual(result["items"][0]["url"], "https://civitai.com/models/10")
+        self.assertTrue(result["more"])
+
+    def test_download_authorization_is_removed_on_cross_host_redirect(self):
+        captured = []
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"data"
+        class Response:
+            def __init__(self, redirected):
+                self.status = 302 if redirected else 200
+                self.headers = {"Location": "https://cdn.example.com/model.bin"} if redirected else {}
+                self.content = Content()
+                self.content_length = 4
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                pass
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                pass
+            def get(self, url, headers, allow_redirects):
+                captured.append((url, dict(headers)))
+                return Response(len(captured) == 1)
+        target = self.base / "models/redirect-auth.bin"
+        with patch.object(self.tasks, "public_url"), patch.object(self.tasks.aiohttp, "TCPConnector"), \
+                patch.object(self.tasks.aiohttp, "ClientSession", return_value=Session()):
+            asyncio.run(self.tasks._download(self.tasks.Task("download", "redirect"), "https://example.com/model.bin", target,
+                                            authorization={"X-API-Key": "private-header"}))
+        self.assertEqual(captured[0][1]["X-API-Key"], "private-header")
+        self.assertNotIn("X-API-Key", captured[1][1])
+        self.assertEqual(target.read_bytes(), b"data")
+
+    def test_github_clone_keeps_repository_and_default_branch_for_manager_updates(self):
+        commands = []
+        def command(arguments, task, label, cwd, env=None):
+            commands.append(arguments)
+            if "clone" in arguments:
+                folder = Path(arguments[-1])
+                (folder / ".git/refs/heads").mkdir(parents=True)
+                (folder / ".git/HEAD").write_text("ref: refs/heads/main\n")
+                (folder / ".git/refs/heads/main").write_text("b" * 40)
+                (folder / ".git/config").write_text('[remote "origin"]\nurl = https://github.com/example/CloneNode\n')
+                (folder / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}")
+                self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+                self.assertEqual(env["GIT_ALLOW_PROTOCOL"], "https")
+            return 0, "done"
+        find_tool = shutil.which
+        with patch.object(self.installer, "_run_command", side_effect=command), \
+                patch.object(self.installer.shutil, "which", side_effect=lambda name: "git-test" if name == "git" else find_tool(name)):
+            result = self.wait_task(self.installer.install_github("https://github.com/example/CloneNode", requirements=False))
+        self.assertTrue(result["git_checkout"])
+        self.assertEqual(result["commit"], "b" * 40)
+        self.assertTrue((self.base / "custom_nodes/CloneNode/.git/HEAD").is_file())
+        self.assertIn("--force", commands[-1])
+        self.assertNotIn("--detach", commands[-1])
+
+    def test_setup_install_is_default_and_attempted_once(self):
+        async def run():
+            application = web.Application()
+            application.add_routes(self.routes.routes)
+            async with TestClient(TestServer(application)) as client:
+                with patch.object(self.installer, "manager_present", return_value=False), patch.object(self.installer, "install_github", return_value=types.SimpleNamespace(id="manager-task")) as install:
+                    self.security.write_json(self.security.SETTINGS, {}, private=True)
+                    first = await client.post("/robot/setup", json={})
+                    self.assertEqual((await first.json())["task"], "manager-task")
+                    second = await client.post("/robot/setup", json={})
+                    self.assertNotIn("task", await second.json())
+                    install.assert_called_once()
+                response = await client.post("/robot/storage/cleanup", json={"groups": ["trash"]})
+                self.assertEqual(response.status, 400)
+        try:
+            asyncio.run(run())
+        finally:
+            self.security.write_json(self.security.SETTINGS, {}, private=True)
+
+    def test_export_import_round_trip_into_a_fresh_comfyui_layout(self):
+        workflow = self.base / "user/default/workflows/portable.json"
+        workflow.write_text('{"nodes": []}', encoding="utf-8")
+        output = self.base / "output/portable.png"
+        output.write_bytes(b"portable-output")
+        package = self.base / "custom_nodes/portable-private"
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}", encoding="utf-8")
+        profile = self.base / "user/portable-profile"
+        profile.mkdir(exist_ok=True)
+        (profile / "comfy.settings.json").write_text(json.dumps({"Comfy.Graph.ZoomSpeed": 1.5, "Secret.Token": "exclude"}))
+        exported = self.wait_task(self.backup.create_backup({"preset": "setup", "outputs": "all"}))
+        imported = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
+        shutil.copyfile(self.backup.EXPORTS / (exported["export_id"] + ".zip"), imported)
+        fresh = Path(self.temp.name) / "FreshComfyUI"
+        for name in ("custom_nodes", "models", "output", "input", "temp", "user/.robot_file_manager"):
+            (fresh / name).mkdir(parents=True, exist_ok=True)
+        paths = sys.modules["folder_paths"]
+        with patch.multiple(paths, base_path=str(fresh), models_dir=str(fresh / "models"), folder_names_and_paths={},
+                get_user_directory=lambda: str(fresh / "user"), get_output_directory=lambda: str(fresh / "output"),
+                get_input_directory=lambda: str(fresh / "input"), get_temp_directory=lambda: str(fresh / "temp")), \
+                patch.object(self.backup, "SETTINGS", fresh / "user/.robot_file_manager/settings.json"):
+            summary = self.backup.validate_archive(imported)
+            files = [item["archive"] for item in summary["files"] if item["path"].endswith(("portable.json", "portable.png"))]
+            result = self.wait_task(self.migration.restore(imported.stem, {"selected_files": files,
+                "custom_nodes": ["portable-private"], "models": [], "install_manager": False, "install_requirements": False}))
+        self.assertFalse(result["report"]["errors"])
+        self.assertEqual((fresh / "output/portable.png").read_bytes(), b"portable-output")
+        self.assertTrue((fresh / "user/default/workflows/portable.json").is_file())
+        self.assertTrue((fresh / "custom_nodes/portable-private/__init__.py").is_file())
+        preferences = json.loads((fresh / "user/portable-profile/comfy.settings.json").read_text())
+        self.assertEqual(preferences, {"Comfy.Graph.ZoomSpeed": 1.5})
+
+    def test_output_only_archive_is_importable_and_large_selection_uses_exclusions(self):
+        output = self.base / "output/output-only-roundtrip.png"
+        output.write_bytes(b"output-only")
+        exported = self.wait_task(self.backup.create_backup({"workflows": False, "models": False,
+            "custom_nodes": False, "plugin_settings": False, "comfy_settings": False, "outputs": "all"}))
+        imported = self.backup.IMPORTS / (uuid.uuid4().hex + ".zip")
+        shutil.copyfile(self.backup.EXPORTS / (exported["export_id"] + ".zip"), imported)
+        output.unlink()
+        summary = self.backup.validate_archive(imported)
+        self.assertEqual(summary["workflows"], 0)
+        self.assertEqual(summary["models"], [])
+        excluded = [item["archive"] for item in summary["files"] if item["path"] != output.name]
+        self.wait_task(self.migration.restore(imported.stem, {"excluded_files": excluded, "install_manager": False,
+            "comfy_settings": False, "plugin_settings": False}))
+        self.assertEqual(output.read_bytes(), b"output-only")
 
 
 if __name__ == "__main__":

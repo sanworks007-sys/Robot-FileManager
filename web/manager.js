@@ -2,7 +2,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const BASE = "/robot";
-const pages = ["Files", "Downloads", "History", "Models", "Workflows", "Outputs", "Node Installer", "Backup & Restore", "Tasks", "Terminal", "Trash", "Settings"];
+const pages = ["Files", "Browser", "Downloads", "History", "Models", "Workflows", "Outputs", "Node Installer", "Backup & Restore", "Tasks", "Terminal", "Trash", "Storage Cleanup", "Settings"];
 const state = {
     page: "Files", root: "output", path: "", roots: [], entries: [], selected: new Set(),
     history: [], historyIndex: -1, clipboard: null, view: "list", sort: "name", source: null,
@@ -190,6 +190,10 @@ async function init() {
     await navigate(state.roots.some(item => item.id === "output") ? "output" : state.roots[0].id, "", false);
     const pendingInstall = localStorage.getItem("Robot.FileManager.pendingInstall");
     showPage(pendingInstall ? "Node Installer" : "Files");
+    act(async () => {
+        const setup = await request("/setup", {});
+        if (setup.task) notify("Installing the GitHub edition of ComfyUI-Manager. Progress is in Tasks; restart when finished.");
+    });
     if (pendingInstall) {
         shell.hidden = false;
         localStorage.removeItem("Robot.FileManager.pendingInstall");
@@ -259,7 +263,8 @@ function showPage(page) {
     if (page === "Files" || page === "Outputs") {
         if (page === "Outputs" && state.root !== "output") navigate("output", "");
         renderFiles();
-    } else if (page === "Downloads") renderDownloads();
+    } else if (page === "Browser") act(renderBrowser);
+    else if (page === "Downloads") renderDownloads();
     else if (page === "History") act(renderHistory);
     else if (page === "Models") act(renderModels);
     else if (page === "Workflows") act(renderWorkflows);
@@ -268,6 +273,7 @@ function showPage(page) {
     else if (page === "Tasks") act(() => refreshTasks(true));
     else if (page === "Terminal") act(renderTerminal);
     else if (page === "Trash") act(renderTrash);
+    else if (page === "Storage Cleanup") act(renderStorage);
     else if (page === "Settings") act(renderSettings);
 }
 
@@ -643,7 +649,14 @@ function renderDownloads() {
             destination.value = chosenRoot; folder.value = chosenPath; showStorage();
         })));
         const selectAll = check("Select all files");
-        controls.append(element("span", "rfm-muted", "Download to"), destination, folder, browse, selectAll[0]);
+        const authorization = select([["", "Provider token / no custom authorization"]], "");
+        act(async () => {
+            const config = await request("/settings");
+            for (const profile of Object.values(config.auth_profiles || {})) {
+                const option = element("option", "", `${profile.name} · ${profile.host}`); option.value = profile.name; authorization.append(option);
+            }
+        });
+        controls.append(element("span", "rfm-muted", "Download to"), destination, folder, browse, authorization, selectAll[0]);
         results.append(controls);
         const rows = element("div", "rfm-download-files");
         const choices = [];
@@ -664,7 +677,7 @@ function renderDownloads() {
             if (!selected.length) return notify("Select at least one file", true);
             const items = selected.map(item => ({ url: item.file.url, root: destination.value, folder: folder.value.trim(),
                 filename: item.filename.value.trim(), model_type: info.model_type, model_name: info.model_name,
-                sha256: item.file.sha256 }));
+                sha256: item.file.sha256, auth_profile: authorization.value }));
             const response = await request("/download/queue", { items });
             queueNotice(response);
             await drawQueue();
@@ -897,11 +910,24 @@ function taskRow(task) {
     if (task.total && task.speed) detail.append(element("span", "", `ETA ${Math.max(0, Math.ceil((task.total - task.bytes) / task.speed))}s`));
     row.append(detail);
     if (task.error) row.append(element("p", "rfm-bad", task.error));
-    if (task.kind === "install-node" && task.result) {
+    if (["install-node", "migration"].includes(task.kind) && task.result) {
         if (task.result.stage) row.append(element("p", "rfm-muted", task.result.stage));
         if (task.result.installed) row.append(element("p", "rfm-muted", `${task.result.package} installed.${task.result.requirements_installed ? " Requirements installed." : " No Python packages installed."} ${task.result.dependency_check === true ? "Dependency check passed." : task.result.dependency_check === false ? "The Python environment has dependency conflicts; review the output before restarting." : ""}`));
         if (task.result.output) row.append(element("pre", "rfm-terminal-output", task.result.output));
+        if (task.result.note) row.append(element("p", "rfm-muted", task.result.note));
     }
+    if (task.result?.report) {
+        const report = task.result.report;
+        row.append(element("p", "rfm-muted", `${report.restored || 0} files/plugins restored · ${report.skipped || 0} skipped · ${report.items?.length || 0} plugin/model steps ready · ${report.errors?.length || 0} issues`));
+        for (const item of report.errors || []) row.append(element("p", "rfm-bad", `${item.name}: ${item.error}`));
+        if (report.restart_required) row.append(button("Restart ComfyUI", () => act(() => restartComfy(true))));
+    }
+    if (task.kind === "cleanup" && task.result) {
+        row.append(element("p", "rfm-muted", `${task.result.removed || 0} items removed · ${bytes(task.result.removed_bytes || 0)} deleted · disk free-space change ${bytes(Math.max(0, task.result.free_space_change || 0))}`));
+        for (const item of task.result.errors || []) row.append(element("p", "rfm-bad", `${item.name}: ${item.error}`));
+    }
+    if (task.kind === "delete" && task.status === "completed" && task.result)
+        row.append(element("p", "rfm-muted", `${task.result.count} removed from disk${task.result.permanent ? " permanently" : " to Trash"} · free-space change ${bytes(Math.max(0, task.result.free_space_change || 0))}`));
     if (task.result?.skipped) row.append(element("p", "rfm-muted", task.result.skipped));
     if (task.status === "completed" && task.result?.size != null && task.kind === "size")
         row.append(element("p", "rfm-muted", `${bytes(task.result.size)} in ${task.result.files} file(s)`));
@@ -911,7 +937,7 @@ function taskRow(task) {
     const control = async action => { await request("/tasks/control", { id: task.id, action }); await refreshTasks(true); };
     if (task.status === "running" || task.status === "waiting") {
         if (task.kind === "download") actions.append(button("Pause", () => act(() => control("pause"))));
-        if (["download", "copy", "duplicate", "zip", "extract", "hash", "size", "backup", "restore", "upload", "requirements", "install-node"].includes(task.kind))
+        if (["download", "copy", "duplicate", "zip", "extract", "hash", "size", "backup", "restore", "upload", "requirements", "install-node", "migration", "cleanup"].includes(task.kind))
             actions.append(button("Cancel", () => act(() => control("cancel"))));
     }
     if (task.retryable && ["paused", "failed", "cancelled"].includes(task.status)) actions.append(button(task.status === "paused" ? "Resume" : "Retry", () => act(() => control(task.status === "paused" ? "resume" : "retry"))));
@@ -924,9 +950,16 @@ function taskRow(task) {
 async function refreshTasks(draw = false) {
     const data = await request("/tasks");
     const previous = new Map(state.tasks.map(task => [task.id, task.status]));
-    const filesChanged = data.tasks.some(task => ["download", "upload", "delete", "move", "rename", "copy", "duplicate", "extract", "restore", "install-node"].includes(task.kind) &&
+    const filesChanged = data.tasks.some(task => ["download", "upload", "delete", "move", "rename", "copy", "duplicate", "extract", "restore", "install-node", "migration", "cleanup"].includes(task.kind) &&
         ["completed", "failed", "cancelled"].includes(task.status) && previous.get(task.id) !== task.status);
     state.tasks = data.tasks;
+    for (const task of data.tasks) if (state.autoDownloadExports?.has(task.id) && ["completed", "failed", "cancelled"].includes(task.status)) {
+        state.autoDownloadExports.delete(task.id);
+        if (task.result?.export_id) {
+            const link = element("a"); link.href = url(`/backup/download/${task.result.export_id}`); link.download = "robot-workspace-backup.zip";
+            document.body.append(link); link.click(); link.remove();
+        }
+    }
     if (filesChanged) {
         state.treeFolders.clear();
         await refreshResources(true);
@@ -1010,6 +1043,24 @@ async function renderInstaller() {
     const title = element("div", "rfm-titlebar");
     title.append(element("h1", "", "Custom Node Installer"), button("Restart ComfyUI", () => act(() => restartComfy())));
     main.append(title, element("p", "rfm-muted", "Choose a ZIP, a custom node folder, or a single Python node from your PC. Review the package, install its requirements into ComfyUI's Python environment, and restart to load it."));
+    const github = section("Install from GitHub");
+    const repository = input("url", "https://github.com/owner/custom-node"); repository.classList.add("rfm-grow");
+    const githubName = input("text", "Folder name (optional)");
+    const githubRequirements = check("Install requirements using ComfyUI's Python", true);
+    const githubRestart = check("Restart when installation and dependency checks succeed", false);
+    const githubLine = element("div", "rfm-toolbar rfm-wrap");
+    githubLine.append(repository, githubName, button("Install repository", () => act(async () => {
+        const response = await request("/custom-nodes/github", { repository: repository.value.trim(), name: githubName.value.trim(), requirements: githubRequirements[1].checked });
+        state.installTask = response.task; state.installAutoRestart = githubRestart[1].checked; state.installHandled = null;
+        await renderInstaller(); notify("GitHub installation started");
+    }), "rfm-primary"));
+    github.append(githubLine, githubRequirements[0], githubRestart[0], element("p", "rfm-muted", "Clones with Git when available, or downloads a repository archive otherwise. Existing plugins are protected. Manager's Git-based updates require Git. Repositories with submodules or extra setup report manual steps."));
+    github.append(button("Install / retry GitHub ComfyUI-Manager", () => act(async () => {
+        const response = await request("/setup", { retry: true });
+        if (response.task) { state.installTask = response.task; state.installAutoRestart = false; state.installHandled = null; await renderInstaller(); }
+        notify(response.present ? "ComfyUI-Manager is already installed" : response.task ? "Manager installation started" : "Enable automatic Manager installation in Settings first");
+    })));
+    main.append(github);
     const upload = section("Upload from PC");
     const file = input("file"); file.accept = ".zip,.py,application/zip"; file.hidden = true;
     const folder = input("file"); folder.multiple = true; folder.setAttribute("webkitdirectory", ""); folder.hidden = true;
@@ -1182,24 +1233,45 @@ async function renderSettings() {
     const result = await request("/settings");
     const general = section("File manager");
     const ttl = input("number", "Hours", String(result.settings.export_ttl_hours)); ttl.min = "1"; ttl.max = "168";
+    const autoManager = check("Install GitHub ComfyUI-Manager automatically when absent", result.settings.auto_install_manager);
     general.append(element("p", "rfm-muted", "Deleting files always asks whether to send them to Trash or delete permanently."),
-        element("p", "rfm-muted", "Temporary export and import ZIP retention (hours)"), ttl);
+        element("p", "rfm-muted", "Temporary export and import ZIP retention (hours)"), ttl, autoManager[0]);
     general.append(button("Save settings", () => act(async () => {
-        await request("/settings", { export_ttl_hours: Number(ttl.value) }); notify("Settings saved");
+        await request("/settings", { export_ttl_hours: Number(ttl.value), auto_install_manager: autoManager[1].checked }); notify("Settings saved");
     }), "rfm-primary"));
     main.append(general);
     const credentials = section("Provider credentials");
     credentials.append(element("p", "rfm-muted", "Tokens stay in the server's private user directory and are never added to backup ZIPs."));
     for (const [platform, label] of [["huggingface", "Hugging Face"], ["civitai", "Civitai"]]) {
-        const row = element("div", "rfm-toolbar");
+        const row = element("div", "rfm-toolbar rfm-wrap");
         const token = input("password", `${label} token`); token.autocomplete = "off";
-        row.append(element("strong", "", label), token,
+        row.append(element("strong", "", `${label}${result.credentials[platform] ? " · configured" : " · no token"}`), token,
             button("Save", () => act(async () => { await request("/settings/credential", { platform, token: token.value }); token.value = ""; notify(`${label} token saved`); })),
-            button("Clear", () => act(async () => { await request("/settings/credential", { platform, token: "" }); token.value = ""; notify(`${label} token cleared`); })));
+            button("Clear", () => act(async () => { await request("/settings/credential", { platform, token: "" }); token.value = ""; notify(`${label} token cleared`); })),
+            button("Test access", () => act(async () => { const response = await request("/settings/credential/test", { platform }); notify(response.message); })));
         row.append(element("span", "rfm-muted", result.credentials[platform] ? "Configured" : "Not configured"));
         credentials.append(row);
     }
     main.append(credentials);
+    const profiles = section("Custom authorization profiles");
+    profiles.append(element("p", "rfm-muted", "Secrets are saved privately on the server and excluded from exports. Select a profile when downloading; it applies only to the exact configured HTTPS host."));
+    for (const profile of Object.values(result.auth_profiles || {})) {
+        const row = element("div", "rfm-toolbar rfm-wrap");
+        row.append(element("span", "", `${profile.name} · ${profile.host} · ${profile.method}`), button("Remove", () => act(async () => {
+            await request("/settings/authorization", { name: profile.name, method: "delete" }); await renderSettings();
+        })));
+        profiles.append(row);
+    }
+    const profileName = input("text", "Profile name"), host = input("text", "Exact host, e.g. models.example.com");
+    const method = select([["bearer", "Bearer token"], ["basic", "Basic authentication"], ["header", "Custom header"]], "bearer");
+    const username = input("text", "Username (Basic only)"), header = input("text", "Header name", "Authorization"), secret = input("password", "Token, password or header value");
+    secret.autocomplete = "new-password";
+    const fields = element("div", "rfm-toolbar rfm-wrap"); fields.append(profileName, host, method, username, header, secret);
+    profiles.append(fields, button("Save authorization profile", () => act(async () => {
+        await request("/settings/authorization", { name: profileName.value.trim(), host: host.value.trim(), method: method.value, username: username.value, header: header.value.trim(), secret: secret.value });
+        secret.value = ""; await renderSettings(); notify("Authorization profile saved");
+    }), "rfm-primary"));
+    main.append(profiles);
     const paths = section("Allowed roots");
     paths.append(element("p", "rfm-muted", "The server owner can approve additional paths in user/.robot_file_manager/allowed_roots.json. On Linux, approving / adds the whole filesystem to Files. Secure ComfyUI access before enabling it."));
     for (const root of state.roots) paths.append(element("div", "rfm-root-row", `${root.id} — ${root.path}`));
@@ -1211,6 +1283,21 @@ function renderBackup() {
     main.append(element("h1", "", "Backup & Restore"));
     const columns = element("div", "rfm-columns");
     const exportCard = section("Export workspace");
+    const quick = element("div", "rfm-toolbar rfm-wrap");
+    const quickExport = async outputs => {
+        const response = await request("/backup/create", { preset: "setup", outputs });
+        state.autoDownloadExports ||= new Set(); state.autoDownloadExports.add(response.task);
+        notify("Setup export started. The ZIP will download when ready; it also remains in Tasks.");
+    };
+    quick.append(button("Export My Setup", () => act(() => quickExport("skip")), "rfm-primary"),
+        button("Export Setup + All Outputs", () => act(() => quickExport("all"))),
+        button("Export All Outputs", () => act(async () => {
+            const response = await request("/backup/create", { workflows: false, models: false, custom_nodes: false,
+                plugin_settings: false, comfy_settings: false, outputs: "all" });
+            state.autoDownloadExports ||= new Set(); state.autoDownloadExports.add(response.task);
+            notify("Output export started. The ZIP will download when ready and can be restored here.");
+        })));
+    exportCard.append(quick, element("p", "rfm-muted", "Setup automatically bundles unpublished and modified custom nodes. Clean GitHub plugins use repository/revision links. Models use a manifest. Outputs are optional and can be large."));
     const workflow = check("Workflows", true);
     const models = check("Model manifest (no model binaries)", true);
     const sources = check("Known model source links", true);
@@ -1291,143 +1378,210 @@ function renderBackup() {
 
 function drawImportSummary(container, data) {
     container.replaceChildren();
-    container.append(element("h3", "", "Archive comparison"));
-    for (const [label, value] of [["Workflows", data.workflows], ["Outputs", data.outputs],
-        ["Models", data.models.length], ["Missing models", data.models.filter(item => item.status === "Missing").length],
-        ["Missing custom nodes", data.custom_nodes.filter(item => item.status === "Missing").length],
-        ["Custom node folders in ZIP", data.manifest.bundled_custom_nodes?.length || 0],
-        ["Uncompressed size", bytes(data.uncompressed_size)], ["Free space", bytes(data.free_space)]]) {
-        const line = element("div", "rfm-summary-line"); line.append(element("span", "", label), element("strong", "", String(value))); container.append(line);
+    container.append(element("h3", "", "Review everything before importing"));
+    container.append(element("p", "rfm-muted", `${data.workflows} workflows · ${data.outputs} outputs · ${data.models.length} models · ${data.custom_nodes.length} plugins · ${bytes(data.uncompressed_size)} unpacked · ${bytes(data.free_space)} free on the user drive`));
+    const environment = data.environment || {};
+    if (environment.python) container.append(element("p", "rfm-muted", `Source: ${environment.platform} / Python ${environment.python}. Package versions are recorded for reference; plugin requirements are installed for this computer.`));
+    if (environment.model_paths?.length) {
+        const paths = element("details"); paths.append(element("summary", "", "Source model-folder configuration"));
+        for (const item of environment.model_paths) paths.append(element("p", "rfm-muted", `${item.root}: ${item.path}${item.external ? " (external)" : ""}`));
+        paths.append(element("p", "rfm-muted", "Choose model destinations below. Old computer paths are not applied to this machine.")); container.append(paths);
     }
-    const restoreWorkflow = check("Restore workflows", true);
-    const restoreOutputs = check("Restore outputs", false);
-    const overwrite = check("Overwrite existing files", false);
-    const restoreSettings = check("Restore ComfyUI settings", false);
-    const restorePlugin = check("Restore File Manager settings", false);
-    const installRequirements = check("Install requirements for selected custom nodes first", false);
-    for (const item of [restoreWorkflow, restoreOutputs, overwrite, restoreSettings, restorePlugin, installRequirements]) container.append(item[0]);
-    container.append(element("p", "rfm-muted", "Restored custom node code runs after a ComfyUI restart. Requirements installation changes the ComfyUI Python environment."));
-    const selectedNodes = [];
-    container.append(button("Restore selected content", () => act(async () => {
-        const customNodes = selectedNodes.filter(item => item.box.checked).map(item => item.name);
-        if (!confirmAction(`Restore selected files${customNodes.length ? ` and ${customNodes.length} custom node folder(s)` : ""}${installRequirements[1].checked ? " and install their requirements" : ""}?`)) return;
-        const result = await request("/backup/restore", { import_id: state.importId, workflows: restoreWorkflow[1].checked,
-            outputs: restoreOutputs[1].checked, overwrite: overwrite[1].checked, comfy_settings: restoreSettings[1].checked,
-            plugin_settings: restorePlugin[1].checked, custom_nodes: customNodes,
-            install_requirements: installRequirements[1].checked });
-        notify(`Restore task ${result.task.slice(0, 8)} queued`);
-    }), "rfm-primary"));
-    container.append(element("h3", "", "Models to restore"));
-    const selected = [];
-    async function queueModels(rows, automatic = false) {
-        const items = [];
-        const unresolved = [];
-        for (const row of rows) {
-            if (!row.source.value || (automatic && Object.keys(row.model.sources || {}).length !== 1)) {
-                unresolved.push(row.model.name); continue;
-            }
-            let info;
-            try { info = await request("/source/info", { value: row.source.value }); }
-            catch { unresolved.push(row.model.name); continue; }
-            const matches = info.files.filter(item => item.name?.toLowerCase() === row.model.name.toLowerCase());
-            const verified = matches.filter(item => row.model.sha256 && item.sha256?.toLowerCase() === row.model.sha256.toLowerCase());
-            const file = verified.length === 1 ? verified[0] : matches.length === 1 ? matches[0] : null;
-            if (!file || (row.model.sha256 && file.sha256 && file.sha256.toLowerCase() !== row.model.sha256.toLowerCase())) {
-                unresolved.push(row.model.name); continue;
-            }
-            items.push({ url: file.url, root: row.root.value, folder: row.folder.value,
-                filename: row.model.name, model_type: row.model.model_type, sha256: row.model.sha256 || file.sha256 });
-        }
-        if (!items.length) return notify(unresolved.length ? `${unresolved.length} model(s) need manual source/file selection` : "Select missing models first", true);
-        let queued = 0, errors = 0, skipped = 0;
-        for (let index = 0; index < items.length; index += 100) {
-            const result = await request("/download/queue", { items: items.slice(index, index + 100) });
-            queued += result.tasks.length;
-            errors += result.errors.length;
-            skipped += result.skipped.length;
-        }
-        notify(`${queued} model download(s) queued${skipped ? `; ${skipped} already present or queued` : ""}${unresolved.length ? `; ${unresolved.length} need manual file selection` : ""}${errors ? `; ${errors} rejected` : ""}`,
-            !!errors);
+    const overwrite = check("Replace existing workflow/output files", false);
+    const settings = check("Restore supported ComfyUI preferences", true);
+    const pluginSettings = check("Restore File Manager preferences", true);
+    const requirements = check("Install selected plugins' Python requirements", true);
+    const manager = check("Install GitHub ComfyUI-Manager when absent", true);
+    for (const item of [overwrite, settings, pluginSettings, requirements, manager]) container.append(item[0]);
+    const selections = [], fileRows = [], nodeRows = [], modelRows = [];
+    const selectionBar = element("div", "rfm-toolbar rfm-wrap");
+    const choose = (rows, value) => { for (const row of rows) if (!row.box.disabled) row.box.checked = value; updateEstimate(); };
+    const estimate = element("p", "rfm-muted");
+    function updateEstimate() {
+        const local = fileRows.filter(row => row.box.checked && !row.box.disabled).reduce((sum, row) => sum + row.file.size, 0);
+        const downloads = modelRows.filter(row => row.box.checked && !row.box.disabled).reduce((sum, row) => sum + (row.model.file_size || 0), 0);
+        estimate.textContent = `${selections.filter(row => row.box.checked && !row.box.disabled).length} selected · ${bytes(local)} selected files + bundled plugin files · approximately ${bytes(downloads)} model downloads. Unknown sizes and plugin dependencies need additional space.`;
     }
-    for (const model of data.models) {
-        const row = element("div", "rfm-restore-row");
-        const needsDownload = ["Missing", "Hash Mismatch"].includes(model.status);
-        const box = input("checkbox"); box.disabled = !needsDownload;
-        const name = element("div"); name.append(element("strong", "", model.name), element("small", "", model.model_type || "Unknown type"));
-        const status = element("span", model.status === "Missing" ? "rfm-bad" : "rfm-good", model.status);
-        const sources = model.sources || {};
-        const source = select(Object.entries(sources).map(([platform, value]) => [value, platform]), Object.values(sources)[0]);
-        if (!source.options.length) {
-            const option = element("option", "", "Source unknown"); option.value = ""; source.append(option);
-        }
-        source.title = "Known source. Inspect uncertain links before downloading.";
-        const expected = model.expected_folder?.replace(/^models\/?/, "") || "";
-        const folder = input("text", "Destination folder", expected);
-        const root = select(rootOptions(), "models");
-        const folderCell = element("div", "rfm-folder-cell");
-        folderCell.append(folder, button("Browse", () => act(() => pickFolder(root.value, folder.value, (chosenRoot, chosenPath) => {
-            root.value = chosenRoot; folder.value = chosenPath;
-        }))));
-        row.append(box, name, status, source, root, folderCell);
-        const actions = element("div", "rfm-actions");
-        if (needsDownload) actions.append(button("Use URL", () => {
-            const value = prompt("Direct file URL, Hugging Face file/repository, or Civitai model URL");
-            if (!value) return;
-            const option = element("option", "", "Custom URL"); option.value = value.trim(); source.append(option); source.value = option.value;
-        }));
-        if (needsDownload) actions.append(button("Inspect source", () => act(async () => {
-            if (!source.value) return notify("No source URL is known", true);
-            const result = await request("/source/info", { value: source.value });
-            state.source = result; showPage("Downloads");
-        })));
-        if (needsDownload) actions.append(button("Locate existing", () => act(async () => {
-            const chosenRoot = prompt("Allowed root ID containing the file", "models");
-            if (!chosenRoot) return;
-            const chosenPath = prompt("Path to existing model file within that root", model.name);
-            if (!chosenPath) return;
-            const found = await request("/models/locate", { root: chosenRoot, path: chosenPath });
-            if (model.sha256 && found.sha256 && model.sha256.toLowerCase() !== found.sha256.toLowerCase()) {
-                return notify("The located file's saved SHA256 does not match the backup", true);
+    selectionBar.append(button("Select All", () => choose(selections, true)), button("Select None", () => choose(selections, false)),
+        button("All workflows", () => choose(fileRows.filter(row => row.file.archive.startsWith("workflows/")), true)),
+        button("All outputs", () => choose(fileRows.filter(row => row.file.archive.startsWith("outputs/")), true)),
+        button("All available plugins", () => choose(nodeRows, true)), button("All missing models", () => choose(modelRows, true)));
+    container.append(selectionBar, estimate);
+    const importButton = button("Import All Selected", () => act(async () => {
+        if (!confirmAction("Import the selected files, install selected plugin code/requirements, and download selected models? Existing plugins are preserved. Restart ComfyUI after installation.")) return;
+        importButton.disabled = true;
+        try {
+            const included = fileRows.filter(row => row.box.checked).map(row => row.file.archive);
+            const excluded = fileRows.filter(row => !row.box.checked).map(row => row.file.archive);
+            const response = await request("/backup/migrate", { import_id: state.importId,
+                selected_files: included.length <= excluded.length ? included : null,
+                excluded_files: included.length > excluded.length ? excluded : [],
+                custom_nodes: nodeRows.filter(row => row.box.checked && !row.box.disabled).map(row => row.node.package),
+                models: modelRows.filter(row => row.box.checked && !row.box.disabled).map(row => ({ index: row.index, source: row.source.value, root: row.root.value, folder: row.folder.value.trim(), auth_profile: row.authorization.value })),
+                overwrite: overwrite[1].checked, comfy_settings: settings[1].checked, plugin_settings: pluginSettings[1].checked,
+                install_requirements: requirements[1].checked, install_manager: manager[1].checked });
+            state.migrationTask = response.task; showPage("Tasks"); notify("Workspace import started. Review its progress and completion report here.");
+        } finally { importButton.disabled = false; }
+    }), "rfm-primary");
+    container.append(importButton);
+    for (const category of ["workflows", "outputs"]) {
+        const details = element("details", "rfm-import-group"); details.open = category === "workflows";
+        details.append(element("summary", "", category === "workflows" ? "Workflow files" : "Output files"));
+        const rows = (data.files || []).filter(file => file.archive.startsWith(category + "/")).map(file => ({ file, box: { checked: !file.exists, disabled: false } }));
+        for (const row of rows) { fileRows.push(row); selections.push(row); }
+        let shown = 0;
+        const more = button("Show next 100 files", () => drawChunk());
+        const drawChunk = () => {
+            for (const row of rows.slice(shown, shown + 100)) {
+                const file = row.file;
+                const entry = check(`${file.root}/${file.path} · ${bytes(file.size)}${file.exists ? " · already exists (skipped unless replace enabled)" : ""}`, row.box.checked);
+                row.box = entry[1]; row.box.onchange = updateEstimate;
+                details.insertBefore(entry[0], more);
             }
-            status.textContent = model.sha256 && found.sha256 ? "Hash Match" : "Located (unverified)";
-            status.className = model.sha256 && found.sha256 ? "rfm-good" : "rfm-muted";
-            name.append(element("small", "", `${found.root}/${found.path}`));
-            box.checked = false; box.disabled = true;
-            notify(`Located ${found.name}`);
-        })));
-        row.append(actions);
-        container.append(row);
-        const selection = { model, box, source, root, folder };
-        if (needsDownload) actions.append(button("Download this model", () => act(() => queueModels([selection]))));
-        selected.push(selection);
+            shown += 100; more.hidden = shown >= rows.length;
+        };
+        details.append(more); drawChunk();
+        container.append(details);
     }
-    container.append(button("Queue selected missing models", () => act(() => queueModels(selected.filter(item => item.box.checked))), "rfm-primary"));
-    container.append(button("Queue all with one known source", () => act(() => queueModels(selected.filter(item => !item.box.disabled), true))));
-    container.append(element("h3", "", "Custom nodes"));
+    container.append(element("h3", "", "Plugins"));
     for (const node of data.custom_nodes) {
-        const row = element("div", "rfm-workflow-row");
-        if (node.bundled && !node.files_present) {
-            const box = input("checkbox");
-            row.append(box);
-            selectedNodes.push({ name: node.package, box });
-        }
-        row.append(element("span", "", node.package || node.nodes?.join(", ") || "Unknown package"),
-            element("span", node.status === "Missing" ? "rfm-bad" : "rfm-good", node.status));
-        if (node.bundled) row.append(element("small", "rfm-muted", node.files_present ? "Files already present" : "Included in ZIP"));
-        if (node.requirements_present && node.status !== "Installed") {
-            row.append(button("Install requirements", () => act(async () => {
-                if (!confirmAction(`Install ${node.package} requirements into the ComfyUI Python environment?`)) return;
-                await request("/custom-nodes/install-requirements", { package: node.package });
-                notify("Requirements installation queued; restart ComfyUI after it completes");
-            })));
-        }
-        if (node.repository) {
-            const link = element("a", "", "Repository / install guidance");
-            link.href = node.repository; link.target = "_blank"; link.rel = "noopener noreferrer";
-            row.append(link);
-        }
-        container.append(row);
+        const row = element("div", "rfm-import-item");
+        const available = node.bundled || /^https:\/\/github\.com\//i.test(node.repository || "") || node.files_present;
+        const entry = check(`${node.package} · ${node.status} · ${node.bundled ? "files in ZIP" : node.repository ? "repository download" : "no saved source"}`, !node.files_present && available);
+        entry[1].disabled = !available; entry[1].onchange = updateEstimate;
+        row.append(entry[0]);
+        if (node.repository) { const link = element("a", "", "Repository"); link.href = node.repository; link.target = "_blank"; link.rel = "noopener noreferrer"; row.append(link); }
+        if (node.commit) row.append(element("small", "rfm-muted", `Saved revision ${node.commit.slice(0, 12)}`));
+        if (!available) row.append(element("p", "rfm-bad", "Manual installation required: this backup contains neither files nor an installable GitHub URL."));
+        const item = { node, box: entry[1] }; nodeRows.push(item); selections.push(item); container.append(row);
     }
+    container.append(element("h3", "", "Models and download destinations"));
+    const authorizationChoices = [];
+    data.models.forEach((model, index) => {
+        const row = element("div", "rfm-import-item");
+        const needs = ["Missing", "Hash Mismatch"].includes(model.status);
+        const entry = check(`${model.name} · ${model.status} · ${bytes(model.file_size)}`, needs && Object.keys(model.sources || {}).length === 1);
+        entry[1].disabled = !needs; entry[1].onchange = updateEstimate; row.append(entry[0]);
+        const sources = Object.entries(model.sources || {});
+        const source = select(sources.map(([name, value]) => [value, name]), sources[0]?.[1]);
+        if (!sources.length) { const option = element("option", "", "Source unknown — add a URL"); option.value = ""; source.append(option); }
+        const root = select(rootOptions(), "models");
+        const authorization = select([["", "Provider token / no custom authorization"]], "");
+        authorizationChoices.push(authorization);
+        const folder = input("text", "Destination subfolder", model.expected_folder?.replace(/^models\/?/, "") || "");
+        root.onchange = () => { folder.value = ""; };
+        const controls = element("div", "rfm-toolbar rfm-wrap"); controls.append(source, root, folder, authorization,
+            button("Browse", () => act(() => pickFolder(root.value, folder.value, (chosenRoot, path) => { root.value = chosenRoot; folder.value = path; }))));
+        if (needs) controls.append(button("Set source URL", () => {
+            const value = prompt("Public direct file URL, Hugging Face file/repository URL, or Civitai model URL");
+            if (!value) return; const option = element("option", "", "Custom source"); option.value = value.trim(); source.append(option); source.value = option.value;
+            entry[1].checked = true; updateEstimate();
+        }), button("Inspect files", () => act(async () => {
+            if (!source.value) throw new Error("Set a source URL first");
+            state.source = await request("/source/info", { value: source.value }); showPage("Downloads");
+        })));
+        row.append(controls);
+        if (model.status === "Hash Mismatch") row.append(element("p", "rfm-bad", "Choose a different destination or remove the conflicting model before downloading."));
+        if (!sources.length) row.append(element("p", "rfm-muted", "Original source unknown. Add a source to download this model; no source is guessed automatically."));
+        const item = { model, index, box: entry[1], source, root, folder, authorization }; modelRows.push(item); selections.push(item); container.append(row);
+    });
+    act(async () => {
+        const config = await request("/settings");
+        for (const control of authorizationChoices) for (const profile of Object.values(config.auth_profiles || {})) {
+            const option = element("option", "", `${profile.name} · ${profile.host}`); option.value = profile.name; control.append(option);
+        }
+    });
+    updateEstimate();
+}
+
+async function renderBrowser() {
+    const main = $(".rfm-main"); main.replaceChildren();
+    main.append(element("h1", "", "Browser"));
+    const browser = state.browser ||= { url: "https://civitai.com", history: ["https://civitai.com"], index: 0, bookmarks: [], page: 1 };
+    if (!browser.loaded) {
+        try { browser.bookmarks = JSON.parse(localStorage.getItem("Robot.FileManager.bookmarks") || "[]").filter(value => typeof value === "string"); } catch { browser.bookmarks = []; }
+        browser.loaded = true;
+    }
+    const address = input("url", "https://…", browser.url); address.classList.add("rfm-grow"); address.setAttribute("aria-label", "Website address");
+    const frame = element("iframe", "rfm-browser-frame"); frame.title = "Website view"; frame.referrerPolicy = "no-referrer";
+    frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox");
+    const validate = value => { const parsed = new URL(value); if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error("Enter an HTTPS website URL without credentials"); return parsed; };
+    const go = (value, record = true) => {
+        const parsed = validate(value); browser.url = parsed.href; address.value = parsed.href;
+        if (record) { browser.history = browser.history.slice(0, browser.index + 1); browser.history.push(parsed.href); browser.index++; }
+        frame.src = parsed.href; frame.hidden = false;
+    };
+    const bar = element("div", "rfm-toolbar rfm-wrap");
+    bar.append(button("←", () => act(() => { if (browser.index > 0) go(browser.history[--browser.index], false); })),
+        button("→", () => act(() => { if (browser.index < browser.history.length - 1) go(browser.history[++browser.index], false); })),
+        button("↻", () => act(() => go(browser.url, false))), address, button("Go", () => act(() => go(address.value.trim()))),
+        button("Open / log in in browser", () => act(() => window.open(validate(address.value.trim()).href, "_blank", "noopener,noreferrer"))),
+        button("Inspect model URL", () => act(async () => { state.source = await request("/source/info", { value: address.value.trim() }); showPage("Downloads"); })));
+    address.onkeydown = event => { if (event.key === "Enter") act(() => go(address.value.trim())); };
+    main.append(bar, element("p", "rfm-muted", "Some sites block embedded browsing or login. Use Open / log in in browser for those sites. Website sessions stay in your browser; server downloads use Settings tokens. Back/forward tracks addresses opened here."));
+    const bookmarks = element("div", "rfm-toolbar rfm-wrap");
+    const drawBookmarks = () => {
+        bookmarks.replaceChildren(button("Civitai", () => act(() => go("https://civitai.com"))), button("Hugging Face", () => act(() => go("https://huggingface.co/models"))),
+            button("Bookmark page", () => act(() => {
+                const parsed = validate(address.value.trim()); parsed.search = ""; parsed.hash = "";
+                browser.bookmarks = [...new Set([...browser.bookmarks, parsed.href])].slice(-20);
+                localStorage.setItem("Robot.FileManager.bookmarks", JSON.stringify(browser.bookmarks)); drawBookmarks();
+            })), button("Clear bookmarks", () => { browser.bookmarks = []; localStorage.removeItem("Robot.FileManager.bookmarks"); drawBookmarks(); }));
+        for (const value of browser.bookmarks) bookmarks.append(button(value.replace(/^https:\/\//, ""), () => act(() => go(value))));
+    };
+    drawBookmarks(); main.append(bookmarks);
+    const catalog = section("Find models inside File Manager");
+    const platform = select([["civitai", "Civitai"], ["huggingface", "Hugging Face"]], browser.platform || "civitai");
+    const query = input("search", "Search models", browser.query || ""); query.classList.add("rfm-grow");
+    const results = element("div", "rfm-browser-grid");
+    const search = async page => {
+        browser.query = query.value.trim(); browser.platform = platform.value; browser.page = page;
+        empty(results, "Finding models…");
+        const response = await request("/browser/search", { platform: platform.value, query: browser.query, page });
+        results.replaceChildren();
+        for (const model of response.items) {
+            const card = section(model.name); card.classList.add("rfm-model-card");
+            if (model.image) { try { const image = element("img"); image.src = validate(model.image).href; image.alt = model.name; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; card.prepend(image); } catch { /* Provider returned no usable image. */ } }
+            card.append(element("p", "rfm-muted", model.type), button("Select version / files", () => act(async () => { state.source = await request("/source/info", { value: model.url }); showPage("Downloads"); }), "rfm-primary"),
+                button("View website", () => act(() => go(model.url)))); results.append(card);
+        }
+        if (!response.items.length) empty(results, "No models found. Try a different search.");
+        const paging = element("div", "rfm-toolbar");
+        if (page > 1) paging.append(button("Previous results", () => act(() => search(page - 1))));
+        paging.append(element("span", "rfm-muted", `Page ${page}`));
+        if (response.more) paging.append(button("Next results", () => act(() => search(page + 1))));
+        results.append(paging);
+    };
+    const searchBar = element("div", "rfm-toolbar"); searchBar.append(platform, query, button("Search", () => act(() => search(1)), "rfm-primary"));
+    query.onkeydown = event => { if (event.key === "Enter") act(() => search(1)); };
+    catalog.append(searchBar, results); main.append(catalog, frame); frame.hidden = true;
+}
+
+async function renderStorage() {
+    const main = $(".rfm-main"); main.replaceChildren(); main.append(element("h1", "", "Storage Cleanup"));
+    const loading = element("p", "rfm-muted", "Scanning server storage…"); main.append(loading);
+    const preview = await request("/storage/preview");
+    if (state.page !== "Storage Cleanup") return;
+    loading.remove();
+    main.append(element("p", "rfm-muted", preview.note));
+    const labels = { trash: "File Manager Trash", exports: "Temporary export ZIPs", imports: "Uploaded import ZIPs", staging: "Node uploads older than 24 hours", partials: "Inactive partial downloads" };
+    const choices = [];
+    for (const [name, label] of Object.entries(labels)) {
+        const stats = preview.groups[name] || { items: 0, size: 0 };
+        const entry = check(`${label}: ${stats.items} items · ${bytes(stats.size)}`); entry[1].disabled = !stats.items;
+        choices.push({ name, box: entry[1] }); main.append(entry[0]);
+    }
+    const recycle = check(`Windows Recycle Bin for the server account: ${preview.recycle_bin.items} items · ${bytes(preview.recycle_bin.size)}`);
+    recycle[1].disabled = !preview.recycle_bin.supported || !preview.recycle_bin.items;
+    main.append(recycle[0]);
+    if (!preview.recycle_bin.supported) main.append(element("p", "rfm-muted", "Windows Recycle Bin cleanup is available only on a Windows ComfyUI server."));
+    main.append(element("p", "rfm-muted", "Permanent deletion bypasses Trash. Cleanup does not remove other copies, hard links or filesystem snapshots. Space held by an open file is released when the owning process closes it."),
+        button("Refresh preview", () => act(renderStorage)), button("Permanently clean selected storage", () => act(async () => {
+            const groups = choices.filter(item => item.box.checked && !item.box.disabled).map(item => item.name);
+            if (!groups.length && !recycle[1].checked) return notify("Select a cleanup category first", true);
+            if (!confirmAction("Permanently remove the selected server storage? Selected Recycle Bin cleanup empties the server account's entire Windows Recycle Bin. This cannot be undone.")) return;
+            await request("/storage/cleanup", { groups, recycle_bin: recycle[1].checked, confirm: true }); showPage("Tasks");
+        }), "rfm-danger"));
 }
 
 app.registerExtension({

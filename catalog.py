@@ -3,6 +3,8 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -11,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import folder_paths
 
-from .security import DATA, download_url, resolve, roots, safe_url
+from .security import DATA, download_url, read_json, resolve, roots, safe_url
 from .tasks import TASKS
 
 
@@ -258,6 +260,8 @@ def custom_node_manifest(workflow_reports):
     for folder in base.iterdir() if base.is_dir() else ():
         if folder.is_dir() and not folder.is_symlink() and not folder.name.startswith(".") and folder.name not in ("__pycache__", "node_modules", "venv"):
             used.setdefault(folder.name, {"package": folder.name, "nodes": set(), "used_by_workflows": set(), "repository": None, "commit": None})
+        elif folder.is_file() and folder.suffix == ".py" and folder.name != "__init__.py":
+            used.setdefault(folder.name, {"package": folder.name, "nodes": set(), "used_by_workflows": set(), "repository": None, "commit": None})
     for package, item in used.items():
         item["nodes"] = sorted(item["nodes"])
         item["used_by_workflows"] = sorted(item["used_by_workflows"])
@@ -266,6 +270,12 @@ def custom_node_manifest(workflow_reports):
             continue
         config = folder / ".git" / "config"
         head = folder / ".git" / "HEAD"
+        item["modified"] = True
+        marker = folder / ".robot-source.json"
+        if marker.is_file() and not marker.is_symlink():
+            source = read_json(marker, {})
+            item["repository"] = source.get("repository")
+            item["commit"] = source.get("commit")
         if config.is_file():
             data = config.read_text(encoding="utf-8", errors="replace")
             match = re.search(r"\[remote \"origin\"\][^\[]*?url\s*=\s*(\S+)", data, re.S)
@@ -284,6 +294,15 @@ def custom_node_manifest(workflow_reports):
                 content = ref.read_text(encoding="utf-8").strip() if ref.is_file() else ""
             if re.fullmatch(r"[0-9a-f]{40}", content):
                 item["commit"] = content
+        if config.is_file() and shutil.which("git"):
+            try:
+                revision = subprocess.run(["git", "-C", str(folder), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+                status = subprocess.run(["git", "-C", str(folder), "status", "--porcelain"], capture_output=True, text=True, timeout=10)
+                if revision.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", revision.stdout.strip()):
+                    item["commit"] = revision.stdout.strip()
+                item["modified"] = status.returncode != 0 or bool(status.stdout.strip())
+            except (OSError, subprocess.TimeoutExpired):
+                item["modified"] = True
     return sorted(used.values(), key=lambda item: item["package"].lower())
 
 
@@ -295,4 +314,6 @@ def installed_custom_nodes():
     for folder in sorted(base.iterdir(), key=lambda item: item.name.lower()):
         if folder.is_dir() and not folder.is_symlink() and not folder.name.startswith(".") and folder.name not in ("__pycache__", "node_modules", "venv"):
             result.append({"package": folder.name, "requirements": (folder / "requirements.txt").is_file()})
+        elif folder.is_file() and not folder.is_symlink() and folder.suffix == ".py" and folder.name != "__init__.py":
+            result.append({"package": folder.name, "requirements": False})
     return result
