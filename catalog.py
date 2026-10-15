@@ -13,8 +13,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import folder_paths
 
-from .security import DATA, download_url, read_json, resolve, roots, safe_url
+from .security import DATA, download_url, public_source_url, read_json, resolve, roots, safe_url
 from .tasks import TASKS
+from .model_info import MODEL_TYPES, clean_details, inspect_file, normalize_type
 
 
 DB = DATA / "models.sqlite3"
@@ -31,6 +32,7 @@ def database():
     try:
         connection.execute("CREATE TABLE IF NOT EXISTS models (path TEXT PRIMARY KEY, sha256 TEXT, source_platform TEXT, source_url TEXT, model_type TEXT, model_name TEXT)")
         connection.execute("CREATE INDEX IF NOT EXISTS models_sha ON models (sha256)")
+        connection.execute("CREATE TABLE IF NOT EXISTS model_details (path TEXT PRIMARY KEY, signature TEXT, automatic TEXT, manual TEXT, candidates TEXT, hash_signature TEXT)")
         yield connection
         connection.commit()
     except Exception:
@@ -47,12 +49,77 @@ def save_model_source(path, platform, url, metadata):
     source_url = download_url(url)
     if platform == "direct" and source_url != url:
         platform, source_url = None, None
+    current = details(path) if path.exists() and path.suffix.lower() in MODEL_EXTENSIONS else None
     with database() as connection:
         connection.execute("INSERT INTO models(path, source_platform, source_url, model_type, model_name, sha256) VALUES (?, ?, ?, ?, ?, ?) "
                            "ON CONFLICT(path) DO UPDATE SET source_platform=COALESCE(excluded.source_platform, models.source_platform), "
                            "source_url=COALESCE(excluded.source_url, models.source_url), "
-                           "model_type=excluded.model_type, model_name=excluded.model_name, sha256=COALESCE(excluded.sha256, models.sha256)",
+                           "model_type=COALESCE(excluded.model_type, models.model_type), model_name=COALESCE(excluded.model_name, models.model_name), sha256=COALESCE(excluded.sha256, models.sha256)",
                            (str(path.resolve()), platform, source_url, metadata.get("model_type"), metadata.get("model_name"), metadata.get("sha256")))
+        if metadata.get("sha256") and path.exists():
+            signature = file_signature(path)
+            connection.execute("INSERT INTO model_details(path, hash_signature) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET hash_signature=excluded.hash_signature", (str(path.resolve()), signature))
+    if current is not None:
+        supplied = clean_details(metadata.get("details", {}))
+        if supplied:
+            automatic = {**current["automatic"], **supplied}
+            if current["automatic"].get("type") != "other":
+                automatic["type"] = current["automatic"]["type"]
+            with database() as connection:
+                connection.execute("UPDATE model_details SET automatic=? WHERE path=?", (json.dumps(automatic), str(path.resolve())))
+
+
+def file_signature(path):
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}"
+
+
+def details(path, cached=None):
+    key, signature = str(path.resolve()), file_signature(path)
+    if cached is None:
+        with database() as connection:
+            cached = connection.execute("SELECT signature, automatic, manual, candidates, hash_signature FROM model_details WHERE path=?", (key,)).fetchone()
+    previous, automatic, manual, candidates, hash_signature = cached or (None, None, None, None, None)
+    if previous != signature:
+        automatic = json.dumps(inspect_file(path))
+        candidates = "[]"
+        with database() as connection:
+            if previous is not None:
+                connection.execute("UPDATE models SET sha256=NULL, source_platform=NULL, source_url=NULL, model_type=NULL, model_name=NULL WHERE path=?", (key,))
+            connection.execute("INSERT INTO model_details(path, signature, automatic, candidates) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature, automatic=excluded.automatic, candidates=excluded.candidates", (key, signature, automatic, candidates))
+    automatic, manual = json.loads(automatic or "{}"), json.loads(manual or "{}")
+    return {**automatic, **manual, "manual": manual, "automatic": automatic,
+            "candidates": json.loads(candidates or "[]"), "hash_current": hash_signature == signature}
+
+
+def edit_details(root_name, relative, value, reset=False):
+    path = resolve(root_name, relative, must_exist=True)
+    if not path.is_file() or path.suffix.lower() not in MODEL_EXTENSIONS:
+        raise ValueError("Choose a model file")
+    if not isinstance(value, dict) or value.get("type", "other") not in MODEL_TYPES:
+        raise ValueError("Choose a supported model type")
+    manual = {} if reset else clean_details(value)
+    for field in ("page_url", "download_url"):
+        if manual.get(field):
+            public_source_url(manual[field])
+    details(path)
+    with database() as connection:
+        connection.execute("UPDATE model_details SET manual=? WHERE path=?", (json.dumps(manual), str(path)))
+    return details(path)
+
+
+def relocate_details(source, target, copy=False):
+    with database() as connection:
+        row = connection.execute("SELECT sha256, source_platform, source_url, model_type, model_name FROM models WHERE path=?", (str(source),)).fetchone()
+        detail = connection.execute("SELECT signature, automatic, manual, candidates, hash_signature FROM model_details WHERE path=?", (str(source),)).fetchone()
+        if row:
+            connection.execute("INSERT OR REPLACE INTO models VALUES (?, ?, ?, ?, ?, ?)", (str(target), *row))
+        if detail:
+            signature = file_signature(target)
+            connection.execute("INSERT OR REPLACE INTO model_details VALUES (?, ?, ?, ?, ?, ?)", (str(target), signature, *detail[1:4], signature if detail[4] == detail[0] else None))
+        if not copy:
+            connection.execute("DELETE FROM models WHERE path=?", (str(source),))
+            connection.execute("DELETE FROM model_details WHERE path=?", (str(source),))
 
 
 def model_type(path, category=None):
@@ -77,6 +144,7 @@ def scan_models():
         candidates.append(("models", root_map["models"]))
     with database() as connection:
         known = {row[0]: row[1:] for row in connection.execute("SELECT path, sha256, source_platform, source_url, model_type, model_name FROM models")}
+        known_details = {row[0]: row[1:] for row in connection.execute("SELECT * FROM model_details")}
     for root_name, root in candidates:
         if not root.is_dir():
             continue
@@ -96,9 +164,14 @@ def scan_models():
                 except OSError:
                     continue
                 sha, platform, url, stored_type, model_name = known.get(key, (None, None, None, None, None))
+                info = details(path, known_details.get(key))
+                if known_details.get(key) and known_details[key][0] != file_signature(path):
+                    sha, platform, url, stored_type, model_name = (None, None, None, None, None)
+                kind = info["manual"]["type"] if "type" in info["manual"] else info.get("type") if info.get("type") != "other" else normalize_type(stored_type) if stored_type else model_type(path, category)
                 found[key] = {"name": filename, "root": root_name, "path": path.relative_to(root).as_posix(),
-                              "type": stored_type or model_type(path, category), "size": stat.st_size, "modified": stat.st_mtime,
-                              "sha256": sha, "source_platform": platform, "source_url": url, "model_name": model_name}
+                              "type": kind, "size": stat.st_size, "modified": stat.st_mtime, "details": info,
+                              "sha256": sha if info["hash_current"] else None, "source_platform": platform,
+                              "source_url": info["manual"].get("download_url") or info["manual"].get("page_url") or url, "model_name": info.get("name") or model_name}
     return sorted(found.values(), key=lambda item: (item["type"], item["name"].lower()))
 
 
@@ -110,7 +183,7 @@ def model_totals(refresh=False):
         return {"count": SUMMARY["count"], "size": SUMMARY["size"]}
 
 
-def hash_model(root_name, relative):
+def hash_model(root_name, relative, *, task=None):
     path = resolve(root_name, relative, must_exist=True)
     if not path.is_file() or path.suffix.lower() not in MODEL_EXTENSIONS:
         raise ValueError("Select a model file")
@@ -118,6 +191,7 @@ def hash_model(root_name, relative):
         digest = hashlib.sha256()
         total = path.stat().st_size
         count = 0
+        before = file_signature(path)
         with path.open("rb") as stream:
             while True:
                 task.check()
@@ -128,10 +202,14 @@ def hash_model(root_name, relative):
                 count += len(chunk)
                 task.progress(count, total)
         value = digest.hexdigest()
+        if before != file_signature(path):
+            raise ValueError("The model changed while hashing; try again when writes finish")
+        details(path)
         with database() as connection:
             connection.execute("INSERT INTO models(path, sha256) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET sha256=excluded.sha256", (str(path), value))
+            connection.execute("UPDATE model_details SET hash_signature=? WHERE path=?", (before, str(path)))
         return {"sha256": value}
-    return TASKS.add("hash", path.name, run)
+    return run(task) if task is not None else TASKS.add("hash", path.name, run)
 
 
 def locate_model(root_name, relative):

@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import importlib
+import hashlib
 import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import threading
@@ -59,6 +62,8 @@ class CoreTests(unittest.TestCase):
             prompt_queue=types.SimpleNamespace(get_tasks_remaining=lambda: 0)))
         sys.modules["server"] = server
         cls.routes = importlib.import_module("rfm.routes")
+        cls.identification = cls.routes.identification
+        cls.updater = cls.routes.updater
 
     @classmethod
     def tearDownClass(cls):
@@ -286,7 +291,7 @@ class CoreTests(unittest.TestCase):
         self.wait_task(self.backup.restore_backup(path.stem, workflows=False, comfy_settings=True, plugin_settings=True))
         restored = json.loads(comfy.read_text(encoding="utf-8"))
         self.assertEqual(restored, {"Other.Setting": "keep", "Comfy.Minimap.Visible": True})
-        self.assertEqual(self.security.settings(), {"trash": False, "export_ttl_hours": 12, "auto_install_manager": True, "manager_setup_attempted": False})
+        self.assertEqual(self.security.settings(), {"trash": False, "export_ttl_hours": 12, "auto_install_manager": True, "manager_setup_attempted": False, "check_updates": True, "auto_update": False})
         self.security.write_json(self.security.SETTINGS, {"trash": True, "export_ttl_hours": 24}, private=True)
 
     def test_workflow_restore_ignores_unselected_output_size(self):
@@ -1001,6 +1006,232 @@ class CoreTests(unittest.TestCase):
         self.wait_task(self.migration.restore(imported.stem, {"excluded_files": excluded, "install_manager": False,
             "comfy_settings": False, "plugin_settings": False}))
         self.assertEqual(output.read_bytes(), b"output-only")
+
+    def safetensor(self, name, tensors, metadata=None):
+        path = self.base / "models" / name
+        header = {key: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]} for key in tensors}
+        header["__metadata__"] = metadata or {}
+        raw = json.dumps(header).encode()
+        path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"1234")
+        return path
+
+    def test_lora_header_detection_and_metadata_without_loading_weights(self):
+        path = self.safetensor("detected-lora.safetensors", ["lora_unet_test.lora_down.weight"],
+            {"ss_base_model_version": "sdxl", "ss_output_name": "Test LoRA", "modelspec.trigger_phrase": "robot, metallic", "recommended_strength": "0.7"})
+        model = next(item for item in self.catalog.scan_models() if item["name"] == path.name)
+        self.assertEqual(model["type"], "lora")
+        self.assertEqual(model["details"]["base_model"], "sdxl")
+        self.assertEqual(model["details"]["trigger_words"], ["robot", "metallic"])
+        self.assertEqual(model["details"]["recommended_strength"], "0.7")
+
+    def test_header_detection_distinguishes_checkpoint_diffusion_and_vae(self):
+        examples = [("checkpoint", ["model.diffusion_model.input_blocks.0.weight", "first_stage_model.decoder.weight"]),
+            ("diffusion_model", ["double_blocks.0.weight"]), ("vae", ["encoder.conv.weight", "decoder.conv.weight", "quant_conv.weight"]),
+            ("other", ["unknown.weight"])]
+        for expected, keys in examples:
+            path = self.safetensor("detected-" + expected + ".safetensors", keys)
+            self.assertEqual(self.catalog.details(path)["type"], expected)
+
+    def test_manual_metadata_survives_scan_rename_and_copy(self):
+        path = self.safetensor("manual-model.safetensors", ["lora_unet_x.lora_down.weight"])
+        self.catalog.edit_details("models", path.name, {"type": "diffusion_model", "name": "Custom label", "notes": "keep me"})
+        self.wait_task(self.catalog.hash_model("models", path.name))
+        self.wait_task(self.tasks.file_operation("rename", [{"root": "models", "path": path.name}], {"root": "models", "path": ""}, "manual-renamed.safetensors"))
+        model = next(item for item in self.catalog.scan_models() if item["name"] == "manual-renamed.safetensors")
+        self.assertEqual(model["type"], "diffusion_model")
+        self.assertEqual(model["details"]["notes"], "keep me")
+        self.assertTrue(model["sha256"])
+        self.wait_task(self.tasks.file_operation("duplicate", [{"root": "models", "path": model["path"]}], {"root": "models", "path": ""}, "manual-copy.safetensors"))
+        duplicate = next(item for item in self.catalog.scan_models() if item["name"] == "manual-copy.safetensors")
+        self.assertEqual(duplicate["details"]["name"], "Custom label")
+        self.assertEqual(duplicate["sha256"], model["sha256"])
+
+    def test_changed_model_invalidates_hash_and_header_cache(self):
+        path = self.safetensor("changing-model.safetensors", ["lora_unet_x.lora_down.weight"])
+        self.wait_task(self.catalog.hash_model("models", path.name))
+        self.safetensor(path.name, ["double_blocks.0.weight"], {"ss_output_name": "Replaced"})
+        model = next(item for item in self.catalog.scan_models() if item["name"] == path.name)
+        self.assertEqual(model["type"], "diffusion_model")
+        self.assertIsNone(model["sha256"])
+
+    def test_identification_saves_verified_provider_metadata_and_preserves_manual_type(self):
+        path = self.safetensor("online-lora.safetensors", ["lora_unet_x.lora_down.weight"])
+        self.catalog.edit_details("models", path.name, {"type": "other", "notes": "my note"})
+        async def sources(filename, sha256):
+            self.assertEqual(sha256, hashlib.sha256(path.read_bytes()).hexdigest())
+            return [{"platform": "civitai", "url": "https://civitai.com/api/download/models/123", "confidence": "Exact Hash Match",
+                "details": {"type": "lora", "name": "Verified LoRA", "base_model": "SDXL", "trigger_words": ["robot"]}}]
+        with patch.object(self.providers, "find_sources", side_effect=sources):
+            result = self.wait_task(self.identification.identify([{"root": "models", "path": path.name}], online=True, calculate_hash=True))
+        self.assertEqual(result["identification"]["verified_sources"], 1)
+        model = next(item for item in self.catalog.scan_models() if item["name"] == path.name)
+        self.assertEqual(model["type"], "other")
+        self.assertEqual(model["details"]["notes"], "my note")
+        self.assertEqual(model["details"]["base_model"], "SDXL")
+        self.assertEqual(model["source_url"], "https://civitai.com/api/download/models/123")
+
+    def test_unverified_source_candidates_do_not_become_saved_source(self):
+        path = self.safetensor("possible-source.safetensors", ["unknown.weight"])
+        async def sources(*_args):
+            return [{"platform": "huggingface", "url": "https://huggingface.co/example/possible", "confidence": "Possible Match"}]
+        with patch.object(self.providers, "find_sources", side_effect=sources):
+            self.wait_task(self.identification.identify([{"root": "models", "path": path.name}], online=True))
+        model = next(item for item in self.catalog.scan_models() if item["name"] == path.name)
+        self.assertIsNone(model["source_url"])
+        self.assertEqual(model["details"]["candidates"][0]["confidence"], "Possible Match")
+
+    def test_invalid_or_unsupported_header_returns_unknown(self):
+        path = self.base / "models/invalid-header.safetensors"
+        path.write_bytes(struct.pack("<Q", 2 ** 63))
+        self.assertEqual(self.catalog.details(path)["type"], "other")
+        path = self.base / "models/unsafe-pickle.ckpt"
+        path.write_bytes(b"pickle content must not execute")
+        self.assertEqual(self.catalog.details(path)["type"], "other")
+
+    def test_metadata_round_trip_in_backup_preserves_target_manual_corrections(self):
+        path = self.safetensor("annotations.safetensors", ["lora_unet_x.lora_down.weight"])
+        self.catalog.edit_details("models", path.name, {"type": "lora", "base_model": "SDXL", "notes": "exported note"})
+        result = self.wait_task(self.backup.create_backup({"workflows": False, "models": True, "outputs": "skip"}))
+        with zipfile.ZipFile(self.backup.EXPORTS / (result["export_id"] + ".zip")) as archive:
+            record = next(item for item in json.loads(archive.read("models_manifest.json")) if item["name"] == path.name)
+        self.assertEqual(record["metadata"]["manual"]["notes"], "exported note")
+        self.catalog.edit_details("models", path.name, {"type": "lora", "notes": "target correction"})
+        self.backup.restore_model_metadata(record, path)
+        self.assertEqual(self.catalog.details(path)["notes"], "target correction")
+
+    def update_fixture(self, name):
+        root = Path(self.temp.name) / name
+        (root / "web").mkdir(parents=True)
+        (root / "__init__.py").write_text("# old version\n")
+        (root / "routes.py").write_text("VALUE = 1\n")
+        (root / "web/manager.js").write_text("// old JS")
+        (root / "web/manager.css").write_text("/* old CSS */")
+        return root
+
+    def test_archive_self_update_and_rollback_preserve_recovery(self):
+        root = self.update_fixture("UpdateTarget")
+        private = Path(self.temp.name) / "UpdatePrivate"
+        private.mkdir()
+        async def download(task, url, target, token=None):
+            with zipfile.ZipFile(target, "w") as archive:
+                for name, text in {"__init__.py": "# new version\n", "routes.py": "VALUE = 2\n", "web/manager.js": "// new JS", "web/manager.css": "/* new CSS */"}.items():
+                    archive.writestr("repo/" + name, text)
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), \
+                patch.object(self.updater, "idle", return_value=True), patch.object(self.updater, "_download", side_effect=download):
+            state = self.updater.initialize()
+            state["latest"] = {"available": True, "commit": "a" * 40}
+            self.security.write_json(self.updater.STATE, state, private=True)
+            result = self.wait_task(self.updater.install_update())
+            self.assertTrue(result["restart_required"])
+            self.assertEqual((root / "routes.py").read_text(), "VALUE = 2\n")
+            self.wait_task(self.updater.rollback())
+            self.assertEqual((root / "routes.py").read_text(), "VALUE = 1\n")
+
+    def test_self_update_refuses_local_changes_and_busy_server(self):
+        root = self.update_fixture("ModifiedUpdateTarget")
+        private = Path(self.temp.name) / "ModifiedUpdatePrivate"
+        private.mkdir()
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), patch.object(self.updater, "idle", return_value=True):
+            self.updater.initialize()
+            (root / "routes.py").write_text("VALUE = 'local correction'\n")
+            with self.assertRaisesRegex(ValueError, "Local plugin changes"):
+                self.updater.install_update()
+        with patch.object(self.updater, "idle", return_value=False), self.assertRaisesRegex(ValueError, "Finish workflows"):
+            self.updater.install_update()
+
+    def test_update_archive_rejects_traversal_without_changing_installation(self):
+        root = self.update_fixture("UnsafeUpdateTarget")
+        private = Path(self.temp.name) / "UnsafeUpdatePrivate"
+        private.mkdir()
+        async def download(task, url, target, token=None):
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("repo/../../outside.py", "pass")
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), \
+                patch.object(self.updater, "idle", return_value=True), patch.object(self.updater, "_download", side_effect=download):
+            state = self.updater.initialize()
+            state["latest"] = {"available": True, "commit": "b" * 40}
+            self.security.write_json(self.updater.STATE, state, private=True)
+            task = self.updater.install_update()
+            deadline = time.time() + 5
+            while task.status in ("waiting", "running") and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(task.status, "failed")
+            self.assertEqual((root / "routes.py").read_text(), "VALUE = 1\n")
+
+    def test_update_check_reports_remote_version_without_executing_it(self):
+        root = self.update_fixture("CheckUpdateTarget")
+        private = Path(self.temp.name) / "CheckUpdatePrivate"
+        private.mkdir()
+        async def api(url, platform=None):
+            if "/contents/" in url:
+                return {"encoding": "base64", "content": base64.b64encode(b'VERSION = "9.1.0"\nraise RuntimeError("must not execute")').decode()}
+            if "/commits/" in url:
+                return {"sha": "c" * 40, "commit": {"message": "New update"}}
+            return {"default_branch": "main"}
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), \
+                patch.object(self.providers, "request_json", side_effect=api):
+            result = asyncio.run(self.updater.check_updates())
+        self.assertEqual(result["latest"]["version"], "9.1.0")
+        self.assertTrue(result["latest"]["available"])
+
+    def test_failed_archive_update_restores_previous_files(self):
+        root = self.update_fixture("RollbackOnFailureTarget")
+        private = Path(self.temp.name) / "RollbackOnFailurePrivate"
+        private.mkdir()
+        async def download(task, url, target, token=None):
+            with zipfile.ZipFile(target, "w") as archive:
+                for name in ("__init__.py", "routes.py", "web/manager.js", "web/manager.css"):
+                    archive.writestr("repo/" + name, "# new\n" if name.endswith(".py") else "/* new */")
+        real_copy = shutil.copyfile
+        def fail_copy(source, target, *args, **kwargs):
+            if str(target).endswith("routes.py.robot-update"):
+                raise OSError("simulated write failure")
+            return real_copy(source, target, *args, **kwargs)
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), \
+                patch.object(self.updater, "idle", return_value=True), patch.object(self.updater, "_download", side_effect=download), \
+                patch.object(self.updater.shutil, "copyfile", side_effect=fail_copy):
+            state = self.updater.initialize()
+            state["latest"] = {"available": True, "commit": "d" * 40}
+            self.security.write_json(self.updater.STATE, state, private=True)
+            task = self.updater.install_update()
+            deadline = time.time() + 5
+            while task.status in ("waiting", "running") and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(task.status, "failed")
+            self.assertEqual((root / "routes.py").read_text(), "VALUE = 1\n")
+            self.assertEqual((root / "__init__.py").read_text(), "# old version\n")
+
+    def test_resource_refresh_handles_a_destination_not_created_yet(self):
+        async def run():
+            app = web.Application()
+            app.add_routes(self.routes.routes)
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/robot/system/stats", params={"root": "models", "path": "not-created-yet/subfolder"})
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertGreater((await response.json())["disk"]["total"], 0)
+        asyncio.run(run())
+
+    def test_update_git_trust_is_scoped_to_its_own_installation(self):
+        process = types.SimpleNamespace(returncode=0, stdout=b"test", stderr=b"")
+        with patch.object(self.updater.subprocess, "run", return_value=process) as run:
+            self.updater.git("rev-parse", "HEAD")
+        arguments = run.call_args.args[0]
+        self.assertIn("safe.directory=" + str(self.updater.ROOT.resolve()), arguments)
+        self.assertNotIn("safe.directory=*", arguments)
+
+    def test_automatic_update_tolerates_a_cached_failed_check_without_latest(self):
+        root = self.update_fixture("CachedFailedUpdateTarget")
+        private = Path(self.temp.name) / "CachedFailedUpdatePrivate"
+        private.mkdir()
+        with patch.multiple(self.updater, ROOT=root, DATA=private, STATE=private / "state.json", RECOVERY=private / "recovery"), \
+                patch.object(self.updater, "settings", return_value={"check_updates": True, "auto_update": True}), \
+                patch.object(self.updater, "install_update") as install:
+            state = self.updater.initialize()
+            state["checked_at"] = time.time()
+            self.security.write_json(self.updater.STATE, state, private=True)
+            self.updater.automatic()
+            install.assert_not_called()
+            self.assertNotIn("last_error", self.security.read_json(self.updater.STATE, {}))
 
 
 if __name__ == "__main__":

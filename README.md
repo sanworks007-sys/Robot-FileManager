@@ -28,6 +28,26 @@ Settings stores Hugging Face/Civitai tokens and provides access tests. Hugging F
 
 Custom authorization profiles support Bearer tokens, Basic authentication and a custom header. Select a profile in Downloads or the model import preview. Each profile applies only to its exact HTTPS host; authorization headers are removed on redirects to another host. Secrets stay in the private credential store and are excluded from backups. Provider tokens apply automatically to their respective downloads.
 
+## Model identification and LoRA information
+
+Model Library scans supported Safetensors/SFT headers without loading model weights. It recognizes known LoRA/LyCORIS, combined checkpoint, diffusion network, VAE, ControlNet, text encoder, embedding and other supported tensor layouts. Unsupported formats and ambiguous layouts remain unknown or show a folder/provider estimate. Filename extensions alone do not establish a model's type.
+
+Select models and use **Identify selected** or **Identify all visible**. Enable **Calculate SHA256** for a full-file hash, and **Find sources online** to query Civitai/Hugging Face using the filename/hash. Progress and cancellation are in Tasks. Header information and hashes are cached; changing the file invalidates its hash and detected source associations. Model files are never uploaded for identification.
+
+Source candidates distinguish provider hash matches, locally saved source associations, filename matches and possible matches. Only provider hash matches are accepted automatically. Filename searches cannot guarantee identity, and deleted/private/unindexed models can have no recoverable public source. Civitai/Hugging Face lookups depend on provider access and API availability.
+
+**Info / edit** shows the model name/version, type, base model, source links and, when supplied by the file/provider, LoRA trigger words and recommended strength. Missing values remain empty. Correct these fields and add notes manually; **Reset manual corrections** returns to detected metadata. Corrections survive rescans, individual model rename/copy/move operations in the file manager and workspace export/import. New Civitai downloads retain available per-version metadata.
+
+Downloads has **↻ Refresh** beside its title. It updates queue progress and storage/resource figures while preserving the source URL, selected files, filenames and destination.
+
+## Self-update
+
+Settings shows the running Robot File Manager version, update status, **Check for Updates**, **Update Now** and recovery controls. Updates come from `sanworks007-sys/Robot-FileManager` on GitHub. Automatic checks run at most once every six hours after startup; automatic installation is a separate setting and is off by default. When enabled, it waits for workflows, downloads, terminal commands and file tasks to finish. ComfyUI is not restarted automatically.
+
+Updates are downloaded into private staging, checked for safe archive paths and Python syntax, and backed up before installation. Git checkouts update only by fast-forward; divergent history or local edits block the update. Archive installations record a baseline on first use and protect later modifications. A recovery copy supports rollback, and failed archive writes restore previous files. An update adding `requirements.txt` requires manual dependency review. Restart ComfyUI and refresh its browser page to activate an installed update.
+
+Updates must first be published to the configured GitHub repository. The updater does not publish local changes, and protects uncommitted development work from replacement. Models, workflows, outputs and private credentials are stored outside the plugin update directory.
+
 ## GitHub installation and storage cleanup
 
 Paste a repository URL in **Node Installer → Install from GitHub**. When Git is available, the installer preserves a checkout and its default branch so Manager's update features can work. Saved revisions restore at the recorded commit. Without Git, it installs a GitHub archive; Git-based updates still require Git. Existing node folders are protected. Repositories needing submodules or extra setup report manual steps. Requirements run with ComfyUI's Python, followed by a dependency check.

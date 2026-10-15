@@ -16,7 +16,7 @@ import psutil
 from aiohttp import ClientError, web
 from server import PromptServer
 
-from . import backup, catalog, installer, migration, providers, storage, terminal, transfers
+from . import backup, catalog, identification, installer, migration, providers, storage, terminal, transfers, updater
 from .security import DATA, SETTINGS, child, public_source_url, resolve, roots, settings, write_json
 from .tasks import TASKS, Stopped, error_text, extract_archive, file_operation, measure_size, queue_download, trash_action, trash_list
 
@@ -73,7 +73,11 @@ async def list_roots(request):
 @guarded
 async def system_stats(request):
     root_name = request.query.get("root", "output")
-    folder = resolve(root_name, request.query.get("path", ""), must_exist=True)
+    folder = resolve(root_name, request.query.get("path", ""))
+    while not folder.is_dir():
+        if folder == roots()[root_name]:
+            raise FileNotFoundError("Storage root is unavailable")
+        folder = folder.parent
     def collect():
         disk = shutil.disk_usage(folder)
         memory = psutil.virtual_memory()
@@ -320,7 +324,7 @@ async def enqueue(request):
             token = providers.credential(platform) if platform in ("huggingface", "civitai") else None
             authorization = providers.authorization_headers(item["url"], item.get("auth_profile"))
             task = queue_download(item["url"], item["root"], item.get("folder", ""), item["filename"], platform, token,
-                                  {"model_type": item.get("model_type"), "model_name": item.get("model_name"), "sha256": item.get("sha256")}, authorization=authorization)
+                                  {"model_type": item.get("model_type"), "model_name": item.get("model_name"), "sha256": item.get("sha256"), "details": catalog.clean_details(item.get("details", {}))}, authorization=authorization)
             if task.status == "skipped":
                 skipped.append({"name": task.name, "reason": task.result["skipped"], "task": task.id})
             else:
@@ -403,6 +407,22 @@ async def model_source(request):
     public_source_url(data["url"])
     catalog.save_model_source(path, data["platform"], data["url"], {"model_type": data.get("model_type")})
     return web.json_response({"ok": True})
+
+
+@routes.post("/robot/models/identify")
+@guarded
+async def identify_models(request):
+    data = await body(request)
+    task = identification.identify(data["items"], bool(data.get("online")), bool(data.get("hash")))
+    return web.json_response({"task": task.id})
+
+
+@routes.post("/robot/models/details")
+@guarded
+async def edit_model_details(request):
+    data = await body(request)
+    result = await asyncio.to_thread(catalog.edit_details, data["root"], data["path"], data.get("details", {}), bool(data.get("reset")))
+    return web.json_response({"details": result})
 
 
 @routes.get("/robot/workflows")
@@ -602,6 +622,9 @@ async def set_settings(request):
         current["export_ttl_hours"] = min(168, max(1, int(data["export_ttl_hours"])))
     if "auto_install_manager" in data:
         current["auto_install_manager"] = bool(data["auto_install_manager"])
+    for key in ("check_updates", "auto_update"):
+        if key in data:
+            current[key] = bool(data[key])
     write_json(SETTINGS, current, private=True)
     return web.json_response({"settings": current})
 
@@ -681,4 +704,35 @@ async def migrate_workspace(request):
     return web.json_response({"task": migration.restore(data["import_id"], data).id})
 
 
+@routes.get("/robot/updates")
+@guarded
+async def update_status(request):
+    return web.json_response(await asyncio.to_thread(updater.local_status))
+
+
+@routes.post("/robot/updates/check")
+@guarded
+async def update_check(request):
+    return web.json_response(await updater.check_updates())
+
+
+@routes.post("/robot/updates/install")
+@guarded
+async def update_install(request):
+    data = await body(request)
+    if data.get("confirm") is not True:
+        raise ValueError("Confirm installing the Robot File Manager update")
+    return web.json_response({"task": updater.install_update().id})
+
+
+@routes.post("/robot/updates/rollback")
+@guarded
+async def update_rollback(request):
+    data = await body(request)
+    if data.get("confirm") is not True:
+        raise ValueError("Confirm restoring the previous plugin version")
+    return web.json_response({"task": updater.rollback().id})
+
+
 backup.schedule_cleanup()
+updater.schedule_updates()

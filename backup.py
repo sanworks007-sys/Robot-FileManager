@@ -16,14 +16,15 @@ from pathlib import Path, PurePosixPath
 
 import folder_paths
 
-from .catalog import MODEL_EXTENSIONS, analyze_workflow, custom_node_manifest, database, scan_models, workflow_files
+from .catalog import MODEL_EXTENSIONS, analyze_workflow, custom_node_manifest, database, details, scan_models, workflow_files
+from .model_info import clean_details
 from .security import DATA, PRIVATE, SETTINGS, inside, public_source_url, read_json, relative_path, resolve, roots, settings, write_json
 from .tasks import TASKS
 
 
 FORMAT = "robot-file-manager-backup"
 SCHEMA = 3
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 COMFY_SETTINGS_ALLOWLIST = {"Comfy.Minimap.Visible", "Comfy.Queue.History.Expanded", "Comfy.RightSidePanel.IsOpen",
                             "Comfy.Templates.SelectedRunsOn", "Comfy.Templates.SortBy", "Comfy.TutorialCompleted"}
 COMFY_SETTINGS_PREFIXES = ("Comfy.Graph.", "Comfy.Workflow.", "Comfy.Canvas.", "Comfy.Node.", "Comfy.Link.",
@@ -212,6 +213,7 @@ def backup_data(options):
             record = {"name": item["name"], "model_type": item["type"], "relative_path": relative,
                       "expected_folder": str(PurePosixPath(relative).parent), "file_size": item["size"],
                       "used_by_workflows": usage.get(item["name"].lower(), [])}
+            record["metadata"] = {"automatic": item.get("details", {}).get("automatic", {}), "manual": item.get("details", {}).get("manual", {})}
             if item["sha256"]:
                 record["sha256"] = item["sha256"]
             if item["source_url"] and options.get("sources", True):
@@ -486,6 +488,8 @@ def validate_archive(path):
             if model.get("sha256") is not None and (not isinstance(model["sha256"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", model["sha256"])):
                 raise ValueError("Invalid model SHA256")
             sources = model.get("sources", {})
+            if not isinstance(model.get("metadata", {}), dict):
+                raise ValueError("Invalid model metadata")
             if not isinstance(sources, dict):
                 raise ValueError("Invalid model source entry")
             for url in sources.values():
@@ -711,10 +715,27 @@ def restore_backup(import_id, *, workflows=True, outputs=False, overwrite=False,
                         current["auto_install_manager"] = plugin["auto_install_manager"]
                     write_json(SETTINGS, current, private=True)
                     restored += 1
+            for model in summary["models"]:
+                if not model.get("metadata"):
+                    continue
+                location = model.get("current_location")
+                if location:
+                    restore_model_metadata(model, resolve(location["root"], location["path"], must_exist=True))
         return {"restored": restored, "skipped": skipped, "requirements_installed": installed_requirements,
                 "missing_models": sum(item["status"] == "Missing" for item in summary["models"]),
                 "missing_custom_nodes": sum(item["status"] == "Missing" for item in summary["custom_nodes"])}
     return run(task) if task is not None else TASKS.add("restore", "Restore workspace", run)
+
+
+def restore_model_metadata(model, path):
+    metadata = model.get("metadata", {})
+    automatic, manual = metadata.get("automatic", {}), metadata.get("manual", {})
+    if not isinstance(automatic, dict) or not isinstance(manual, dict):
+        raise ValueError("Invalid model metadata")
+    current = details(path)
+    with database() as connection:
+        connection.execute("UPDATE model_details SET automatic=?, manual=? WHERE path=?",
+            (json.dumps({**clean_details(automatic), **current["automatic"]}), json.dumps({**clean_details(manual), **current["manual"]}), str(path)))
 
 
 def import_archive(identifier):

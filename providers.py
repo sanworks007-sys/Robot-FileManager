@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 import aiohttp
 
 from .catalog import database
+from .model_info import clean_details, normalize_type
 from .security import DATA, download_url, public_url, read_json, safe_url, write_json
 from .tasks import PublicResolver
 
@@ -256,7 +257,12 @@ async def civitai_files(value):
             files.append({"name": item.get("name"), "size": (item.get("sizeKB") or 0) * 1024,
                           "sha256": item.get("hashes", {}).get("SHA256"), "url": download_url(url),
                           "version": version.get("name"), "version_id": version.get("id"),
-                          "base_model": version.get("baseModel")})
+                          "base_model": version.get("baseModel"),
+                          "details": clean_details({"name": model.get("name") if kind == "model" else model.get("model", {}).get("name"),
+                              "type": model.get("type") or model.get("model", {}).get("type"), "version": version.get("name"),
+                              "base_model": version.get("baseModel"), "trigger_words": version.get("trainedWords", []),
+                              "description": version.get("description"), "download_url": download_url(url),
+                              "page_url": f"https://civitai.com/models/{model.get('id') if kind == 'model' else model.get('modelId')}?modelVersionId={version['id']}" if version.get("id") else None})})
     return {"platform": "civitai", "model_name": model.get("name") or model.get("model", {}).get("name"),
             "model_type": model.get("type") or model.get("model", {}).get("type"), "files": files}
 
@@ -300,7 +306,7 @@ async def find_sources(filename, sha256=None):
     with database() as connection:
         if sha256:
             for platform, url in connection.execute("SELECT source_platform, source_url FROM models WHERE sha256=? AND source_url IS NOT NULL", (sha256,)):
-                results.append({"platform": platform, "url": url, "confidence": "Exact Hash Match"})
+                results.append({"platform": platform, "url": url, "confidence": "Saved source for same hash"})
         for path, platform, url in connection.execute("SELECT path, source_platform, source_url FROM models WHERE source_url IS NOT NULL"):
             if path.replace("\\", "/").split("/")[-1].lower() == filename.lower() and not any(item["url"] == url for item in results):
                 results.append({"platform": platform, "url": url, "confidence": "Exact Filename Match"})
@@ -309,7 +315,12 @@ async def find_sources(filename, sha256=None):
             version = await request_json(f"https://civitai.com/api/v1/model-versions/by-hash/{sha256}", "civitai")
             for item in version.get("files", []):
                 if item.get("hashes", {}).get("SHA256", "").lower() == sha256.lower() and item.get("downloadUrl"):
-                    results.append({"platform": "civitai", "url": download_url(item["downloadUrl"]), "confidence": "Exact Hash Match"})
+                    model = version.get("model", {})
+                    page = f"https://civitai.com/models/{version['modelId']}?modelVersionId={version['id']}" if version.get("modelId") and version.get("id") else None
+                    results.append({"platform": "civitai", "url": download_url(item["downloadUrl"]), "confidence": "Exact Hash Match",
+                        "details": clean_details({"name": model.get("name"), "version": version.get("name"), "type": normalize_type(model.get("type")),
+                            "base_model": version.get("baseModel"), "trigger_words": version.get("trainedWords", []), "description": version.get("description"),
+                            "page_url": page, "download_url": download_url(item["downloadUrl"])})})
         except (ValueError, aiohttp.ClientError, OSError):
             pass
     query = quote(PurePosixPath(filename).stem[:100])
@@ -321,9 +332,9 @@ async def find_sources(filename, sha256=None):
                 return []
             try:
                 info = await huggingface_files(repository)
-                matches = [file for file in info["files"] if file["name"].lower() == filename.lower()]
+                matches = [file for file in info["files"] if file["name"].lower() == filename.lower() or sha256 and (file.get("sha256") or "").lower() == sha256.lower()]
                 if matches:
-                    return [{"platform": "huggingface", "url": file["url"], "confidence": "Exact Filename Match"} for file in matches]
+                    return [{"platform": "huggingface", "url": file["url"], "confidence": "Exact Hash Match" if sha256 and (file.get("sha256") or "").lower() == sha256.lower() else "Exact Filename Match"} for file in matches]
             except (ValueError, aiohttp.ClientError, OSError):
                 pass
             return [{"platform": "huggingface", "url": "https://huggingface.co/" + repository, "confidence": "Possible Match"}]
@@ -346,7 +357,7 @@ async def find_sources(filename, sha256=None):
                                 "confidence": "Possible Match"})
     except (ValueError, aiohttp.ClientError, OSError):
         pass
-    priority = {"Exact Hash Match": 0, "Exact Filename Match": 1, "Possible Match": 2}
+    priority = {"Exact Hash Match": 0, "Saved source for same hash": 1, "Exact Filename Match": 2, "Possible Match": 3}
     unique = {}
     for item in results:
         key = (item["platform"], item["url"])

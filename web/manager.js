@@ -601,7 +601,14 @@ function showContext(x, y, item) {
 
 function renderDownloads() {
     const main = $(".rfm-main"); main.replaceChildren();
-    main.append(element("h1", "", "Server Downloads"));
+    const title = element("div", "rfm-titlebar");
+    const refreshed = element("span", "rfm-muted");
+    const refresh = button("↻ Refresh", () => act(async () => {
+        refresh.disabled = true; refresh.textContent = "Refreshing…";
+        try { await refreshTasks(false); await drawQueue(); await refreshResources(true); refreshed.textContent = `Updated ${new Date().toLocaleTimeString()}`; }
+        finally { refresh.disabled = false; refresh.textContent = "↻ Refresh"; }
+    }));
+    title.append(element("h1", "", "Server Downloads"), refreshed, refresh); main.append(title);
     main.append(element("p", "rfm-muted", "Paste a direct HTTPS URL, Hugging Face repository or file, or Civitai model link. Files download on the ComfyUI server."));
     const source = section("Find files");
     const line = element("div", "rfm-toolbar");
@@ -677,7 +684,7 @@ function renderDownloads() {
             if (!selected.length) return notify("Select at least one file", true);
             const items = selected.map(item => ({ url: item.file.url, root: destination.value, folder: folder.value.trim(),
                 filename: item.filename.value.trim(), model_type: info.model_type, model_name: info.model_name,
-                sha256: item.file.sha256, auth_profile: authorization.value }));
+                sha256: item.file.sha256, auth_profile: authorization.value, details: item.file.details || {} }));
             const response = await request("/download/queue", { items });
             queueNotice(response);
             await drawQueue();
@@ -772,6 +779,25 @@ async function renderModels() {
         models = models.filter(model => counts.get(model.sha256 || model.name.toLowerCase()) > 1);
     }
     title.append(element("span", "rfm-muted", `${models.length} model(s) · ${bytes(models.reduce((sum, model) => sum + (model.size || 0), 0))}`));
+    const chosen = new Set();
+    if (state.modelTab !== "Missing") {
+        const tools = element("div", "rfm-toolbar rfm-wrap");
+        const all = check("Select all visible models");
+        const online = check("Find sources online (sends filename/hash)");
+        const hash = check("Calculate SHA256 (reads complete files)");
+        const matches = model => `${model.name} ${model.path} ${model.type}`.toLowerCase().includes(search.value.toLowerCase());
+        const start = async onlySelected => {
+            const selected = models.filter(model => matches(model) && (!onlySelected || chosen.has(model.root + "/" + model.path)));
+            if (!selected.length) throw new Error("Select models first");
+            const response = await request("/models/identify", { items: selected.map(model => ({ root: model.root, path: model.path })), online: online[1].checked, hash: hash[1].checked });
+            notify(`Identification queued: ${response.task.slice(0, 8)}. Progress is in Tasks.`);
+        };
+        all[1].onchange = () => { for (const model of models.filter(matches)) {
+            const key = model.root + "/" + model.path; all[1].checked ? chosen.add(key) : chosen.delete(key);
+        } draw(); };
+        tools.append(all[0], online[0], hash[0], button("Identify selected", () => act(() => start(true))), button("Identify all visible", () => act(() => start(false))));
+        main.insertBefore(tools, list);
+    }
     function draw() {
         list.replaceChildren();
         const visible = models.filter(model => `${model.name} ${model.path || ""} ${model.type || ""}`.toLowerCase().includes(search.value.toLowerCase()));
@@ -782,6 +808,11 @@ async function renderModels() {
         for (const model of visible) {
             const row = element("div", "rfm-model-row");
             const name = element("div"); name.append(element("strong", "", model.name));
+            if (state.modelTab !== "Missing") {
+                const box = input("checkbox"); box.setAttribute("aria-label", `Select ${model.name}`); box.checked = chosen.has(model.root + "/" + model.path);
+                box.onchange = () => { const key = model.root + "/" + model.path; box.checked ? chosen.add(key) : chosen.delete(key); }; name.prepend(box);
+                name.append(element("small", "rfm-muted", model.details?.manual?.type ? "Manual type" : model.details?.confidence || "Folder estimate"));
+            }
             if (model.path) name.append(element("small", "", `${model.root}/${model.path}`));
             row.append(name, element("span", "", model.type),
                 element("span", "", model.used_by_workflows ? `${model.used_by_workflows.length} workflow(s)` : bytes(model.size)));
@@ -800,6 +831,7 @@ async function renderModels() {
                 })));
             } else {
                 const parent = model.path.split("/").slice(0, -1).join("/");
+                actions.append(button("Info / edit", () => showModelInfo(model)));
                 actions.append(button("Open folder", () => act(async () => {
                     showPage("Files");
                     await navigate(model.root, parent);
@@ -837,6 +869,46 @@ async function renderModels() {
     }
     search.oninput = draw;
     draw();
+}
+
+function showModelInfo(model) {
+    const cover = element("div", "rfm-picker-cover"), panel = section(model.name);
+    panel.classList.add("rfm-picker", "rfm-model-info"); panel.setAttribute("role", "dialog"); panel.setAttribute("aria-modal", "true");
+    const details = model.details || {};
+    panel.append(element("p", "rfm-muted", `${details.confidence || "Folder estimate"}: ${details.evidence || model.type}`));
+    const fields = {};
+    const type = select(["other", "lora", "checkpoint", "diffusion_model", "vae", "controlnet", "text_encoder", "clip", "embedding", "upscaler", "ipadapter", "unet"].map(value => [value, value]), model.type);
+    fields.type = type;
+    const typeLabel = element("label", "rfm-info-field", "Model type"); typeLabel.append(type); panel.append(typeLabel);
+    for (const [key, label, value] of [["name", "Display name", details.name || model.model_name || model.name], ["version", "Model version", details.version],
+        ["base_model", "Base model / architecture", details.base_model], ["trigger_words", "LoRA trigger words (comma separated)", (details.trigger_words || []).join(", ")],
+        ["recommended_strength", "Recommended strength (when known)", details.recommended_strength], ["page_url", "Model website", details.page_url],
+        ["download_url", "Public download URL", details.download_url || model.source_url], ["notes", "Your notes", details.notes]]) {
+        const field = input("text", label, value || ""); fields[key] = field;
+        const wrapper = element("label", "rfm-info-field", label); wrapper.append(field); panel.append(wrapper);
+    }
+    if (details.description) { const description = element("details"); description.append(element("summary", "", "Provider description"), element("p", "rfm-muted", details.description)); panel.append(description); }
+    panel.append(element("h3", "", "Source matches"));
+    if (!(details.candidates || []).length) panel.append(element("p", "rfm-muted", "No saved matches. Use Identify with online lookup and SHA256 to search for a verified source."));
+    for (const candidate of details.candidates || []) {
+        const row = element("div", "rfm-import-item");
+        const link = element("a", "", `${candidate.confidence} · ${candidate.platform}`); link.href = candidate.url; link.target = "_blank"; link.rel = "noopener noreferrer";
+        row.append(link, element("small", "rfm-muted", candidate.url), button("Use this source", () => {
+            fields.download_url.value = candidate.url;
+            if (candidate.details) for (const key of ["name", "version", "base_model", "page_url", "recommended_strength", "type"])
+                if (candidate.details[key]) fields[key].value = candidate.details[key];
+            if (candidate.details?.trigger_words) fields.trigger_words.value = candidate.details.trigger_words.join(", ");
+        })); panel.append(row);
+    }
+    const actions = element("div", "rfm-toolbar rfm-wrap");
+    actions.append(button("Save corrections", () => act(async () => {
+        await request("/models/details", { root: model.root, path: model.path, details: Object.fromEntries(Object.entries(fields).map(([key, field]) => [key, field.value])) });
+        cover.remove(); await renderModels(); notify("Model information saved. Rescans preserve your corrections.");
+    }), "rfm-primary"), button("Reset manual corrections", () => act(async () => {
+        if (!confirmAction("Reset your corrections for this model and use detected metadata?")) return;
+        await request("/models/details", { root: model.root, path: model.path, reset: true }); cover.remove(); await renderModels();
+    })), button("Close", () => cover.remove()));
+    panel.append(actions); cover.append(panel); shell.append(cover);
 }
 
 async function renderWorkflows() {
@@ -910,12 +982,18 @@ function taskRow(task) {
     if (task.total && task.speed) detail.append(element("span", "", `ETA ${Math.max(0, Math.ceil((task.total - task.bytes) / task.speed))}s`));
     row.append(detail);
     if (task.error) row.append(element("p", "rfm-bad", task.error));
-    if (["install-node", "migration"].includes(task.kind) && task.result) {
+    if (["install-node", "migration", "self-update", "identify"].includes(task.kind) && task.result) {
         if (task.result.stage) row.append(element("p", "rfm-muted", task.result.stage));
         if (task.result.installed) row.append(element("p", "rfm-muted", `${task.result.package} installed.${task.result.requirements_installed ? " Requirements installed." : " No Python packages installed."} ${task.result.dependency_check === true ? "Dependency check passed." : task.result.dependency_check === false ? "The Python environment has dependency conflicts; review the output before restarting." : ""}`));
         if (task.result.output) row.append(element("pre", "rfm-terminal-output", task.result.output));
         if (task.result.note) row.append(element("p", "rfm-muted", task.result.note));
     }
+    if (task.result?.identification) {
+        const report = task.result.identification;
+        row.append(element("p", "rfm-muted", `${report.identified} types identified · ${report.verified_sources} hash-verified sources · ${report.unknown_sources} with no source matches`));
+        for (const item of report.errors) row.append(element("p", "rfm-bad", `${item.name}: ${item.error}`));
+    }
+    if (task.kind === "self-update" && task.result?.restart_required) row.append(button("Restart ComfyUI", () => act(() => restartComfy())));
     if (task.result?.report) {
         const report = task.result.report;
         row.append(element("p", "rfm-muted", `${report.restored || 0} files/plugins restored · ${report.skipped || 0} skipped · ${report.items?.length || 0} plugin/model steps ready · ${report.errors?.length || 0} issues`));
@@ -937,7 +1015,7 @@ function taskRow(task) {
     const control = async action => { await request("/tasks/control", { id: task.id, action }); await refreshTasks(true); };
     if (task.status === "running" || task.status === "waiting") {
         if (task.kind === "download") actions.append(button("Pause", () => act(() => control("pause"))));
-        if (["download", "copy", "duplicate", "zip", "extract", "hash", "size", "backup", "restore", "upload", "requirements", "install-node", "migration", "cleanup"].includes(task.kind))
+        if (["download", "copy", "duplicate", "zip", "extract", "hash", "size", "backup", "restore", "upload", "requirements", "install-node", "migration", "cleanup", "identify"].includes(task.kind))
             actions.append(button("Cancel", () => act(() => control("cancel"))));
     }
     if (task.retryable && ["paused", "failed", "cancelled"].includes(task.status)) actions.append(button(task.status === "paused" ? "Resume" : "Retry", () => act(() => control(task.status === "paused" ? "resume" : "retry"))));
@@ -1234,12 +1312,36 @@ async function renderSettings() {
     const general = section("File manager");
     const ttl = input("number", "Hours", String(result.settings.export_ttl_hours)); ttl.min = "1"; ttl.max = "168";
     const autoManager = check("Install GitHub ComfyUI-Manager automatically when absent", result.settings.auto_install_manager);
+    const checkUpdates = check("Check for Robot File Manager updates automatically", result.settings.check_updates);
+    const autoUpdate = check("Install Robot File Manager updates automatically when idle", result.settings.auto_update);
     general.append(element("p", "rfm-muted", "Deleting files always asks whether to send them to Trash or delete permanently."),
-        element("p", "rfm-muted", "Temporary export and import ZIP retention (hours)"), ttl, autoManager[0]);
+        element("p", "rfm-muted", "Temporary export and import ZIP retention (hours)"), ttl, autoManager[0], checkUpdates[0], autoUpdate[0]);
     general.append(button("Save settings", () => act(async () => {
-        await request("/settings", { export_ttl_hours: Number(ttl.value), auto_install_manager: autoManager[1].checked }); notify("Settings saved");
+        await request("/settings", { export_ttl_hours: Number(ttl.value), auto_install_manager: autoManager[1].checked, check_updates: checkUpdates[1].checked, auto_update: autoUpdate[1].checked }); notify("Settings saved");
     }), "rfm-primary"));
     main.append(general);
+    const updates = section("Robot File Manager self-update");
+    const updateSummary = element("p", "rfm-muted"), updateActions = element("div", "rfm-toolbar rfm-wrap");
+    updates.append(updateSummary, updateActions, element("p", "rfm-muted", "Updates use this plugin's GitHub repository. Local edits block installation. A recovery copy is kept; restart ComfyUI after updating. Updates that add Python dependencies require manual review."));
+    main.append(updates);
+    const drawUpdate = status => {
+        updateSummary.textContent = `Running version ${status.version} · ${status.installed_commit?.slice(0, 12) || "archive installation"}${status.local_changes ? " · local changes protected" : ""}${status.latest?.available ? ` · update available ${status.latest.version || status.latest.commit.slice(0, 12)}` : status.checked_at ? " · no newer compatible update" : " · not checked yet"}${status.latest?.diverged ? " · Git history has diverged; manual review required" : ""}`;
+        updateActions.replaceChildren();
+        const checkButton = button("Check for Updates", () => act(async () => { checkButton.disabled = true; try { drawUpdate(await request("/updates/check", {})); } finally { checkButton.disabled = false; } }));
+        updateActions.append(checkButton);
+        const install = button("Update Now", () => act(async () => {
+            if (!confirmAction("Install the available Robot File Manager update? A recovery copy will be kept. ComfyUI must be idle.")) return;
+            await request("/updates/install", { confirm: true }); showPage("Tasks");
+        }), "rfm-primary"); install.disabled = !status.latest?.available || status.local_changes || status.latest?.diverged;
+        updateActions.append(install);
+        if (status.recovery_available) updateActions.append(button("Restore previous version", () => act(async () => {
+            if (!confirmAction("Restore the previous Robot File Manager version from its recovery copy?")) return;
+            await request("/updates/rollback", { confirm: true }); showPage("Tasks");
+        })));
+        if (status.restart_required) updateActions.append(button("Restart ComfyUI", () => act(() => restartComfy())));
+        if (status.last_error) updates.append(element("p", "rfm-bad", status.last_error));
+    };
+    try { drawUpdate(await request("/updates")); } catch (error) { updateSummary.textContent = error.message; }
     const credentials = section("Provider credentials");
     credentials.append(element("p", "rfm-muted", "Tokens stay in the server's private user directory and are never added to backup ZIPs."));
     for (const [platform, label] of [["huggingface", "Hugging Face"], ["civitai", "Civitai"]]) {

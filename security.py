@@ -58,7 +58,8 @@ def settings():
         saved = {}
     return {"trash": bool(saved.get("trash", True)), "export_ttl_hours": min(168, max(1, int(saved.get("export_ttl_hours", 24)))),
             "auto_install_manager": bool(saved.get("auto_install_manager", True)),
-            "manager_setup_attempted": bool(saved.get("manager_setup_attempted", False))}
+            "manager_setup_attempted": bool(saved.get("manager_setup_attempted", False)),
+            "check_updates": bool(saved.get("check_updates", True)), "auto_update": bool(saved.get("auto_update", False))}
 
 
 def roots():

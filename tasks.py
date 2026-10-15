@@ -111,8 +111,8 @@ class TaskManager:
         task.transfer = transfer
         task.target = target
         with self.lock:
-            if any(item.kind == "cleanup" and item.status in ("waiting", "running") for item in self.tasks.values()):
-                raise ValueError("Wait for storage cleanup to finish before starting another file task")
+            if any(item.kind in ("cleanup", "self-update") and item.status in ("waiting", "running") for item in self.tasks.values()):
+                raise ValueError("Wait for storage cleanup or the plugin update to finish before starting another file task")
             if target and any(item.target == target and item.status in ("waiting", "running", "pausing", "paused", "cancelling")
                               for item in self.tasks.values()):
                 task.status = "skipped"
@@ -147,8 +147,8 @@ class TaskManager:
         task = Task(kind, name)
         task.status = "running"
         with self.lock:
-            if any(item.kind == "cleanup" and item.status in ("waiting", "running") for item in self.tasks.values()):
-                raise ValueError("Wait for storage cleanup to finish before uploading files")
+            if any(item.kind in ("cleanup", "self-update") and item.status in ("waiting", "running") for item in self.tasks.values()):
+                raise ValueError("Wait for storage cleanup or the plugin update to finish before uploading files")
             self.tasks[task.id] = task
         return task
 
@@ -369,6 +369,9 @@ def file_operation(action, sources, destination=None, name=None, permanent=None)
                         transfer_file(source, target, task)
                 else:
                     shutil.move(str(source), str(target))
+                if source.suffix.lower() in (".safetensors", ".ckpt", ".pt", ".pt2", ".pth", ".pkl", ".bin", ".gguf", ".onnx", ".sft") and target.is_file():
+                    from .catalog import relocate_details
+                    relocate_details(source, target, copy=action in ("copy", "duplicate"))
             elif action == "delete":
                 with TASKS.lock:
                     if any(inside(target, source) for target in TASKS.reserved) or any(

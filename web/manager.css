@@ -133,6 +133,9 @@
 .rfm-picker-cover { position: fixed; inset: 0; z-index: 10020; display: grid; place-items: center; background: #000b; }
 .rfm-picker { width: min(580px, 94vw); max-height: 80vh; display: flex; flex-direction: column; color: var(--rfm-text); box-shadow: 0 20px 70px #000b; }
 .rfm-picker-list { min-height: 100px; overflow: auto; border: 1px solid var(--rfm-border); border-radius: 8px; margin: 8px 0 15px; }
+.rfm-model-info { overflow-y: auto; width: min(760px, 94vw); }
+.rfm-info-field { display: flex; flex-direction: column; gap: 5px; margin: 7px 0; }
+.rfm-info-field .rfm-input { width: 100%; }
 .rfm-picker-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--rfm-border); border-radius: 0; }
 .rfm-empty { padding: 30px; text-align: center; color: var(--rfm-muted); }
 .rfm-toast { position: absolute; right: 20px; bottom: 20px; max-width: 480px; padding: 12px 16px; border-radius: 9px; background: #1e6848; color: white; box-shadow: 0 10px 30px #0008; }

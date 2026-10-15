@@ -102,8 +102,10 @@ def restore(import_id, options):
                 platform = providers.detect(file["url"])
                 downloaded = queue_download(file["url"], root, folder, model["name"], platform,
                     providers.credential(platform) if platform in ("huggingface", "civitai") else None,
-                    {"sha256": model.get("sha256") or file.get("sha256"), "model_type": model.get("model_type")},
+                    {"sha256": model.get("sha256") or file.get("sha256"), "model_type": model.get("model_type"), "details": file.get("details", {})},
                     authorization=providers.authorization_headers(file["url"], selection.get("auth_profile")), task=task)
+                if model.get("metadata"):
+                    backup.restore_model_metadata(model, target)
                 report["items"].append({"name": model["name"], "kind": "model", "status": "skipped" if downloaded.get("skipped") else "downloaded"})
             except Stopped:
                 raise
